@@ -6,16 +6,42 @@
   <title>answer-site</title>
   <style>
     :root { color-scheme: dark; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#0b1020; color:#e9eefc; }
+    body {
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:#0b1020; color:#e9eefc;
+    }
     .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
-    .card { background:#0f1835; border:1px solid rgba(255,255,255,.08); border-radius: 18px; padding: 16px; margin-bottom: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.25); }
+    .card {
+      background:#0f1835;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius: 18px;
+      padding: 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.25);
+    }
     h2 { margin:0 0 10px 0; font-size: 18px; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    button { background:#2b6cff; border:none; color:white; padding:10px 14px; border-radius: 12px; font-weight: 700; cursor:pointer; }
+    button {
+      background:#2b6cff;
+      border:none;
+      color:white;
+      padding:10px 14px;
+      border-radius: 12px;
+      font-weight: 700;
+      cursor:pointer;
+      font-size: 13px;
+    }
     button.secondary { background:#243055; }
+    button.danger { background:#b8234a; }
     button:disabled { opacity:.55; cursor:not-allowed; }
-    input { background:#0b1020; color:#e9eefc; border:1px solid rgba(255,255,255,.14); border-radius: 10px; padding:10px 12px; }
+    input {
+      background:#0b1020; color:#e9eefc;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius: 10px; padding:10px 12px;
+    }
     .previewWrap {
+      position: relative;
       height: 70vh;
       min-height: 360px;
       border-radius: 18px;
@@ -23,9 +49,31 @@
       background:#050a18;
       border:1px solid rgba(255,255,255,.08);
     }
-    video, img { width:100%; height:100%; object-fit: contain; background:#000; }
+    video { width:100%; height:100%; object-fit: contain; background:#000; }
+    .countdown {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 88px;
+      font-weight: 900;
+      color: rgba(255,255,255,.95);
+      text-shadow: 0 12px 40px rgba(0,0,0,.65);
+      background: rgba(0,0,0,.25);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .12s ease;
+    }
+    .countdown.show { opacity: 1; }
     .hint { opacity:.8; font-size: 13px; line-height: 1.5; margin-top: 10px; }
-    pre { margin:0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.45; }
+    pre {
+      margin:0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.45;
+    }
     textarea {
       width:100%; min-height: 160px; resize: vertical;
       background:#0b1020; color:#e9eefc;
@@ -40,25 +88,36 @@
 <body>
   <div class="wrap">
     <div class="card">
-      <h2>카메라</h2>
-      <div class="row">
+      <h2>카메라 / 문제풀이</h2>
+      <div class="row" style="margin-bottom:8px;">
         <button id="btnStart">카메라 시작</button>
-        <button id="btnShot" class="secondary">현재 페이지 촬영</button>
+        <button id="btnShot" class="secondary">현재 페이지 촬영(3-2-1)</button>
+        <button id="btnAuto" class="secondary">자동 촬영 시작</button>
+
         <span class="small">현재 페이지</span>
         <input id="page" type="number" value="1" min="1" style="width:90px" />
+
+        <span class="small">자동 대기(초)</span>
+        <input id="autoGap" type="number" value="0.8" min="0" step="0.1" style="width:90px" />
+
         <span id="res" class="small"></span>
       </div>
 
-      <div style="height:12px"></div>
+      <div class="row" style="margin-bottom:8px;">
+        <button id="btnTtsTest" class="secondary">음성 테스트</button>
+      </div>
 
       <div class="previewWrap">
         <video id="video" playsinline autoplay muted></video>
+        <div id="countdown" class="countdown">3</div>
       </div>
 
       <div class="hint">
         ① 시험지를 화면에 꽉 채우고<br/>
         ② 글자/문항번호/보기(A~E)까지 선명하게 보이게 맞춘 뒤<br/>
-        ③ “현재 페이지 촬영” → OCR → 정답 생성 순서로 진행.
+        ③ <b>현재 페이지 촬영</b> 또는 <b>자동 촬영 시작</b>을 누르면,<br/>
+        &nbsp;&nbsp;&nbsp;- 3-2-1 카운트다운 → 촬영 → OCR → 정답 생성 → 정답 음성 낭독 순서로 처리된다.<br/>
+        &nbsp;&nbsp;&nbsp;- <b>자동 촬영은 실패해도 중지하지 않고 같은 페이지를 계속 재시도</b>한다. (성공 시에만 페이지 +1)
       </div>
     </div>
 
@@ -76,6 +135,8 @@
 
     <div class="card">
       <h2>정답</h2>
+      <div class="small">정답은 "1: A" 같은 형식으로 표시됨. 음성으로도 읽어줌.</div>
+      <div style="height:10px"></div>
       <textarea id="ansBox" placeholder="정답 결과가 여기에 표시됨" readonly></textarea>
     </div>
   </div>
@@ -83,13 +144,16 @@
   <script>
     const $ = (id) => document.getElementById(id);
 
-    const video = $("video");
-    const logEl = $("log");
-    const ocrBox = $("ocrBox");
-    const ansBox = $("ansBox");
+    const video   = $("video");
+    const logEl   = $("log");
+    const ocrBox  = $("ocrBox");
+    const ansBox  = $("ansBox");
     const btnShot = $("btnShot");
     const btnStart = $("btnStart");
-    const resEl = $("res");
+    const btnAuto = $("btnAuto");
+    const btnTtsTest = $("btnTtsTest");
+    const resEl  = $("res");
+    const cdEl   = $("countdown");
 
     function ts() {
       const d = new Date();
@@ -105,14 +169,31 @@
     }
 
     let stream = null;
-    let busy = false; // ✅ 연타 방지 락
+    let busy = false;
+    let wakeLock = null;
 
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // ---- 카운트다운(3-2-1) ----
+    async function countdown321() {
+      cdEl.classList.add("show");
+      for (let n = 3; n >= 1; n--) {
+        cdEl.textContent = String(n);
+        await sleep(650);
+      }
+      cdEl.classList.remove("show");
+      cdEl.textContent = "3";
+      await sleep(120);
+    }
+
+    // ---- 카메라 ----
     async function startCamera() {
       if (stream) return;
 
       log("STATUS: 카메라를 켜고, 페이지 1부터 한 페이지씩 촬영해.");
 
-      // ✅ iPhone Safari가 ideal을 무시하는 경우가 있어 min+ideal 같이 줌
       const constraints = {
         audio: false,
         video: {
@@ -129,7 +210,6 @@
         video.onloadedmetadata = () => r();
       });
 
-      // ✅ 가능한 경우 한 번 더 해상도 올리기 시도(실패해도 무시)
       try {
         const track = stream.getVideoTracks()[0];
         await track.applyConstraints({
@@ -140,7 +220,6 @@
         });
       } catch (_) {}
 
-      // ✅ 실제 들어온 해상도 표시
       setTimeout(() => {
         const vw = video.videoWidth;
         const vh = video.videoHeight;
@@ -185,23 +264,98 @@
       return { ok: res.ok && data.ok, ...data };
     }
 
-    btnStart.addEventListener("click", async () => {
+    // ---- Wake Lock ----
+    async function enableWakeLock() {
       try {
-        await startCamera();
+        if ("wakeLock" in navigator && !wakeLock) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          wakeLock.addEventListener("release", () => {
+            log("STATUS: 화면 꺼짐 방지(wake lock) 해제됨.");
+            wakeLock = null;
+          });
+          log("STATUS: 화면 꺼짐 방지(wake lock) 설정됨.");
+        }
       } catch (e) {
-        log(`STATUS: 카메라 실패: ${e?.message || e}`);
+        log(`STATUS: wake lock 설정 실패: ${e?.message || e}`);
       }
-    });
+    }
 
-    btnShot.addEventListener("click", async () => {
-      if (busy) return;         // ✅ 연타 방지
+    async function disableWakeLock() {
+      try {
+        if (wakeLock) {
+          await wakeLock.release();
+          wakeLock = null;
+          log("STATUS: 화면 꺼짐 방지(wake lock) 해제됨.");
+        }
+      } catch (e) {}
+    }
+
+    // ---- TTS ----
+    let ttsEnabled = false;
+
+    function speakNow(text) {
+      return new Promise((resolve) => {
+        if (!("speechSynthesis" in window)) return resolve();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = "ko-KR";
+        utter.rate = 1.0;
+        utter.pitch = 1.0;
+        utter.onend = () => resolve();
+        utter.onerror = () => resolve();
+        window.speechSynthesis.speak(utter);
+      });
+    }
+
+    async function speakTest() {
+      ttsEnabled = true;
+      await speakNow("테스트");
+      log("STATUS: 음성 테스트를 재생했어. 이후 문제풀이 정답도 소리로 읽어줄게.");
+    }
+
+    function parseSolveTextForTts(text) {
+      const items = [];
+      const lines = String(text || "").split(/\r?\n/);
+      for (const raw of lines) {
+        const ln = raw.trim();
+        if (!ln) continue;
+        let m = ln.match(/^(\d{1,3})\s*:\s*([A-E]|[1-5])\b/i);
+        if (m) {
+          const num = Number(m[1]);
+          const ans = m[2].toUpperCase();
+          items.push({ num, ans });
+        }
+      }
+      return { items };
+    }
+
+    async function speakAnswers(text) {
+      if (!ttsEnabled) return;
+      const { items } = parseSolveTextForTts(text);
+
+      for (const { num, ans } of items) {
+        let spokenAns = ans;
+        if ("ABCDE".includes(ans)) {
+          const map = { A:"에이", B:"비", C:"씨", D:"디", E:"이" };
+          spokenAns = map[ans] || ans;
+        }
+        await speakNow(`${num}번, ${spokenAns}`);
+        await sleep(1500);
+      }
+    }
+
+    // ---- 페이지 1회 처리 ----
+    async function processCurrentPageOnce() {
+      if (busy) return { ok: false, reason: "busy" };
       busy = true;
-      btnShot.disabled = true;  // ✅ UI 차단
+      btnShot.disabled = true;
 
       try {
         await startCamera();
 
         const page = Number($("page").value || 1);
+
+        log(`STATUS: 3-2-1 카운트다운 시작`);
+        await countdown321();
 
         log(`STATUS: 페이지 ${page} 촬영 중... 시험지를 흔들리지 않게 잡고 있어줘.`);
         const cap = captureDataURL();
@@ -213,28 +367,117 @@
 
         if (!ocr.ok) {
           log(`STATUS: OCR 실패: ${ocr.error || "Unknown"}${ocr.detail ? " / " + ocr.detail : ""}`);
-          return;
+          if (ttsEnabled) await speakNow("실패");
+          return { ok: false, stage: "ocr", ocr };
         }
 
         ocrBox.value = ocr.text || "";
 
-        log(`STATUS: OCR 완료 (평균 신뢰도: ${ocr.conf ?? 0}, 번호 패턴 수: ${ocr.hits ?? 0}). 이제 정답을 생성할게.`);
+        const meanConf = ocr?.meta?.meanConfidence ?? 0;
+        const qCount = ocr?.meta?.questionNumberCount ?? 0;
+        log(`STATUS: OCR 완료 (평균 신뢰도: ${meanConf}, 번호 패턴 수: ${qCount}). 이제 정답을 생성할게.`);
+
         const solved = await doSolve(page, ocr.text || "");
         log(`solve response ${JSON.stringify(solved).slice(0, 1200)}`);
 
         if (!solved.ok) {
           log(`STATUS: solve 실패: ${solved.error || "Unknown"}`);
-          return;
+          if (ttsEnabled) await speakNow("실패");
+          return { ok: false, stage: "solve", solved };
         }
 
         ansBox.value = solved.text || "";
-        log(`STATUS: 페이지 ${page} 정답을 생성했어. XURTH가 들리면 이 페이지는 끝이야.`);
+        log(`STATUS: 페이지 ${page} 정답을 생성했어.`);
+        await speakAnswers(solved.text || "");
+
+        return { ok: true };
       } catch (e) {
         log(`STATUS: 처리 실패: ${e?.message || e}`);
+        return { ok: false, stage: "fatal", error: e };
       } finally {
         busy = false;
         btnShot.disabled = false;
       }
+    }
+
+    // ---- 자동 촬영 루프 (✅ 실패해도 계속 재시도) ----
+    let autoMode = false;
+    let consecutiveFail = 0;
+
+    async function autoLoop() {
+      try {
+        await startCamera();
+        await enableWakeLock();
+
+        while (autoMode) {
+          const curPage = Number($("page").value || 1);
+
+          const r = await processCurrentPageOnce();
+          if (!autoMode) break;
+
+          const gap = Number($("autoGap").value || 0);
+
+          if (r.ok) {
+            consecutiveFail = 0;
+            // 성공한 경우에만 다음 페이지로
+            $("page").value = String(curPage + 1);
+            log(`STATUS: 자동 촬영 - 성공. 다음 페이지로 이동: ${curPage + 1}`);
+            if (gap > 0) await sleep(gap * 1000);
+            continue;
+          }
+
+          // 실패해도 중지하지 않음: 같은 페이지 유지 + 재시도
+          consecutiveFail++;
+          log(`STATUS: 자동 촬영 - 실패(${consecutiveFail}회). 같은 페이지(${curPage}) 재시도 예정.`);
+
+          // 너무 빠른 재시도 방지: gap가 0이면 기본 1.2초 쉬고 재시도
+          const waitMs = (gap > 0 ? gap * 1000 : 1200);
+          await sleep(waitMs);
+        }
+      } catch (e) {
+        autoMode = false;
+        btnAuto.textContent = "자동 촬영 시작";
+        btnAuto.classList.remove("danger");
+        log(`STATUS: 자동 촬영 오류로 중지: ${e?.message || e}`);
+      }
+    }
+
+    // ---- 버튼 ----
+    btnStart.addEventListener("click", async () => {
+      try {
+        await startCamera();
+        await enableWakeLock();
+      } catch (e) {
+        log(`STATUS: 카메라 실패: ${e?.message || e}`);
+      }
+    });
+
+    btnShot.addEventListener("click", async () => {
+      await processCurrentPageOnce();
+    });
+
+    btnAuto.addEventListener("click", async () => {
+      if (autoMode) {
+        autoMode = false;
+        btnAuto.textContent = "자동 촬영 시작";
+        btnAuto.classList.remove("danger");
+        log("STATUS: 자동 촬영 중지 요청.");
+        return;
+      }
+      consecutiveFail = 0;
+      autoMode = true;
+      btnAuto.textContent = "자동 촬영 중지";
+      btnAuto.classList.add("danger");
+      log("STATUS: 자동 촬영 시작. (실패해도 계속 재시도)");
+      await autoLoop();
+    });
+
+    btnTtsTest.addEventListener("click", () => {
+      speakTest();
+    });
+
+    window.addEventListener("beforeunload", () => {
+      disableWakeLock();
     });
   </script>
 </body>
