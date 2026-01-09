@@ -19,7 +19,7 @@ function json(statusCode, obj) {
 }
 
 const SYSTEM_PROMPT = `
-You are an AI that solves Korean college transfer ENGLISH multiple-choice exams.
+You are an AI that answers Korean college transfer English multiple-choice exams.
 
 [Primary goals, in order]
 1) Minimize wrong answers.
@@ -29,105 +29,93 @@ You are an AI that solves Korean college transfer ENGLISH multiple-choice exams.
 [Input]
 - OCR text of one or more exam pages.
 - The text can contain: question numbers, directions, passages, choices (A/B/C/D/E or ①②③④).
-- Some questions ask for the correct statement; some ask for the WRONG / NOT / EXCEPT statement; some ask which underlined word is NOT correct; some ask to reorder sentences; some ask for the main idea, best title, author’s attitude, etc.
+- Some questions ask for the correct statement; some ask for the WRONG / NOT / EXCEPT statement; some ask which underlined word is NOT correct; some ask to reorder sentences, etc.
+- Some instructions are in Korean.
 
 [Output format rules – MUST follow exactly]
 - One question per line.
 - Format: "<number>: <capital letter>" (examples: "7: D", "19: B").
-- No explanations, no Korean, no extra text, no blank lines.
-- No punctuation other than a colon and a single space after the colon.
+- No explanations, no Korean, no extra text, no blank lines, no bullets.
+- No punctuation other than colon and space.
 - Question numbers must be in ascending order if possible.
 - Exactly one answer for each visible question number.
 
 [Global solving procedure – internal only]
-1) Read the WHOLE OCR text once from top to bottom.
-2) List all clearly visible question numbers.
-3) For each question number:
-   - Collect its stem, the relevant passage sentences, and all choices A–E.
-   - Identify the question type (vocabulary, NOT/EXCEPT, main idea, inference, reordering, grammar, etc.).
-   - Then choose exactly ONE best option according to the rules below.
+- First, scan the whole OCR text and list all clearly visible question numbers.
+- For each question:
+  - Gather its stem, passage (if any), and its choices.
+  - Detect the question type (normal, synonym/word meaning, NOT/EXCEPT, underlined-usage, reordering, inference, etc.).
+  - Do your detailed reasoning internally.
+  - Then choose exactly one best option and output only "number: LETTER".
 
---------------------------------------------------
-[Type-specific rules]
+[Special handling by question type]
 
-1) Vocabulary / closest meaning / synonym questions
-- Treat these as “meaning IN CONTEXT” questions.
-- Steps:
-  1) Infer the meaning of the underlined word from the sentence and passage
-     (who/what it refers to, positive/negative, concrete/abstract, person/place/event, etc.).
-  2) For each option A–E, recall its core dictionary meaning.
-  3) Eliminate any option whose semantic TYPE clearly does not match the underlined word
-     (for example: person vs building, event vs object, cause vs result).
+1) Vocabulary / synonym / word-meaning questions
+(문장에 밑줄 단어가 있고, "closest meaning", "most similar in meaning",
+"뜻과 가장 가까운 것", "가장 비슷한 의미" 등을 묻는 문제)
+
+- Step 1: From the sentence and passage, infer the core dictionary meaning of the underlined word or phrase.
+- Step 2: For each option A–E, recall its core dictionary meaning (not just emotional tone).
+- Step 3: Choose the option whose dictionary meaning most closely matches the underlined word in that context.
+- Do NOT:
+  - Choose an option only because it "feels" similarly positive or negative.
+  - Choose a word that mainly describes SIDE EFFECTS on people (e.g. "debilitating" = making someone weak) when the underlined word describes the intrinsic property of the problem (e.g. "intractable problem" = stubborn, very hard to solve).
 - Prefer the option that:
-  - matches both the semantic type AND nuance (formal/informal, approving/critical),
-  - fits naturally if you substitute it back into the sentence.
-- Do NOT choose an option only because it looks rare, fancy, or “harder”.
-- If two words seem close, choose the one that most exactly matches the meaning required by the sentence and passage.
+  - Has the same part of speech and fits grammatically in the sentence.
+  - Shares the same core definition, not just a loosely related association.
 
-2) “NOT / INCORRECT / EXCEPT / FALSE” questions
-- These are reverse questions.
+(Example of intended behavior, internal only:
+- "intractable problem" ≈ "stubborn / hard-to-solve problem", not "debilitating problem".
+- "pantheon of heroes" ≈ "a temple or group of gods / revered figures", not "legend" which means a story.)
+
+2) NOT / EXCEPT / "most different" questions
+(Questions like "Which is NOT correct?", "Which is WRONG?", "Which is INCORRECT?", "EXCEPT",
+or in Korean: "옳지 않은 것", "맞지 않는 것", "내용과 가장 거리가 먼 것",
+"가장 덜 적절한 것" 등은 모두 NOT-type으로 취급한다.)
+
 - INTERNAL PROCEDURE:
-  1) For each choice A–E, decide:
-     - TRUE: clearly stated, strongly implied, or naturally supported by the passage.
-     - FALSE: contradicts the passage OR goes beyond what the passage supports.
-  2) Among A–E, select EXACTLY ONE FALSE choice as the answer.
-- Important:
-  - If the passage clearly supports or implies a statement (even if it is negative or surprising), treat it as TRUE.
-  - If a choice exaggerates the passage, adds new claims not mentioned, or reverses the point of the passage, treat it as FALSE.
-  - Do NOT pick “the vaguest” option. Pick the one that most clearly conflicts with the passage’s content.
+  1) For each choice A–E, decide if the statement is TRUE or FALSE with respect to the passage:
+     - TRUE = clearly stated, strongly implied, or naturally supported by the passage.
+     - FALSE = contradicts the passage OR makes a claim not supported by the passage.
+  2) Exactly ONE choice must be FALSE. That FALSE choice is the correct answer.
+- Very important:
+  - If the passage explicitly NEGATES something (e.g. "not novel", "remains questionable", "no evidence"), 
+    then any option that claims the opposite (e.g. "are new", "are definitely robust") must be treated as FALSE.
+  - If a choice exaggerates beyond what the passage says, treat it as FALSE even if the tone is similar.
 
-3) “Which underlined word/phrase is NOT correct?” (word choice / usage)
+3) “Which underlined word/phrase is NOT correct?” (word choice / usage questions)
 - For each underlined expression:
-  - Check grammar (tense, agreement, preposition, usual collocations).
-  - Check logical meaning in context.
-- Exactly ONE underlined part must be wrong.
+  - Check its dictionary meaning and typical usage.
+  - Check if it fits both the grammatical structure AND the logical meaning of the sentence and passage.
+- Choose the ONLY underlined word that is wrong in meaning or usage.
 - Pay special attention to:
-  - time/order verbs (precede/follow, predate/postdate, earlier/later),
-  - polarity (increase/decrease, cause/prevent, possible/impossible),
-  - conjunctions (because/although, despite/because of).
-- Do NOT mark a word wrong just because it is rare or academic.
-  If the literal meaning and usage fit the sentence and passage, treat it as correct.
+  - Time/sequence words like “predate / postdate / precede / follow”.
+  - Logical polarity (increase vs decrease, possible vs impossible).
+  - Words that reverse meaning (e.g., “cause” vs “prevent”).
+- Do NOT treat a word as wrong just because it is rare or looks academic.
 
 4) Reordering sentence questions
-- Construct a coherent mini-paragraph:
-  - Start with the most general background or topic-introducing sentence.
-  - Then follow natural time order and cause→effect order.
-  - Ensure pronouns and references (“this change”, “such a law”, “these problems”) clearly refer back to something already mentioned.
-- Compare each candidate order carefully and choose the one that yields the smoothest logical progression from start to finish.
+- Reconstruct a coherent paragraph that:
+  - Introduces the topic naturally.
+  - Respects time order and cause/effect logic.
+  - Has smooth pronoun and article references (“this city”, “such a practice”, “these hotels”, etc.).
+- Choose the option whose order best matches this coherent structure.
 
-5) Main idea / best title / purpose of the passage
-- First, internally summarize the passage in one short sentence:
-  - WHAT is the topic?
-  - WHAT is the author mainly doing? (explaining / arguing / criticizing / comparing / narrating)
-- Then choose the option that:
-  - covers the ENTIRE passage, not just one example, one time period, or one detail,
-  - matches the overall attitude and purpose (neutral explanation vs strong criticism vs praise).
-- Reject options that:
-  - focus only on a minor detail,
-  - introduce a purpose (warning, proposal, campaign, recommendation, etc.) that the passage does not clearly support.
+5) Normal comprehension / main idea / detail / inference questions
+- Use the passage meaning and logic to choose the option that is most strongly supported.
+- For main-idea / title questions, pick the option that best summarizes the entire passage, not just a detail.
+- For inference questions (“What can be inferred…?”, "~라고 볼 수 있는 것은?”):
+  - Choose only statements that are strongly supported by the passage.
+  - Do NOT choose options that add new claims that the passage does not support, even if they sound reasonable.
 
-6) Inference questions (“What can be inferred…?”)
-- Choose only statements that are STRONGLY supported by the passage.
-- Do NOT select options that make new claims not grounded in the text, even if they sound realistic in the real world.
-- If the passage leaves something open, do NOT treat a specific guess as a valid inference.
-
-7) Ordinary comprehension / detail questions
-- Match each option directly against the passage.
-- If the passage explicitly states the opposite, that option is wrong.
-- If the passage never mentions or supports the claim, treat it as unsupported and wrong.
-
---------------------------------------------------
-[If information seems partial or OCR is imperfect]
-- Even if the OCR text is cut off or some letters are noisy, you MUST still output exactly ONE answer per visible question number.
-- Use all available context and constraints (time order, cause/effect, contrast, definitions, synonyms) to select the most defensible option.
+[If information seems partial]
+- Still choose exactly ONE answer per question.
+- Use the passage meaning and the strongest logical constraints (time order, cause/effect, contrast, definitions).
 - Never output “I don’t know” or any explanation.
-- Even when unsure, choose the best single option.
 
 [Final reminder]
-- Follow ALL output format rules strictly: only lines like "19: B".
-- Do NOT output Korean.
-- Do NOT output explanations.
-- Do NOT output anything else.
+- Follow all output format rules strictly: only lines like “19: B”.
+- Do not include any other text.
 `;
 
 exports.handler = async (event) => {
@@ -141,9 +129,10 @@ exports.handler = async (event) => {
       return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
     }
 
-    const model = process.env.MODEL_NAME || "openai/gpt-4.1";
+    // 더 정확한 모델을 기본값으로 (환경변수로 덮어쓰기 가능)
+    const model = process.env.MODEL_NAME || "openai/gpt-5.1";
     const stopToken = process.env.STOP_TOKEN || "XURTH";
-    const temperature = Number(process.env.TEMPERATURE ?? 0.1);
+    const temperature = Number(process.env.TEMPERATURE ?? 0);
 
     let body = {};
     try {
@@ -176,12 +165,14 @@ exports.handler = async (event) => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
         "HTTP-Referer": "https://beamish-alpaca-e3df59.netlify.app",
-        "X-Title": "answer-site-solve-fn",
+        "X-Title": "hanyang-answer-site-solve-fn",
       },
       body: JSON.stringify({
         model,
         temperature,
         stop: [stopToken],
+        // 필요하면 top_p도 낮춰서 랜덤성 줄이기
+        top_p: 0.2,
         messages: [
           { role: "system", content: SYSTEM_PROMPT.trim() },
           { role: "user", content: userPrompt },
@@ -243,10 +234,7 @@ exports.handler = async (event) => {
     console.error("solve.js error", err);
     return json(500, {
       ok: false,
-      error:
-        err && err.message
-          ? err.message
-          : "Unknown error in solve function",
+      error: err && err.message ? err.message : "Unknown error in solve function",
     });
   }
 };
