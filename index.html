@@ -318,16 +318,33 @@
       return { items, unsure: unsureList };
     }
 
+    // ★ 여기만 수정: ABCDE를 숫자(1~5)로 읽도록 변경
     async function speakAnswers(text) {
       if (!ttsEnabled) return;
       const { items, unsure } = parseSolveTextForTts(text);
 
       for (const { num, ans } of items) {
-        let spokenAns = ans;
+        let choiceNumber = null;
+
+        // solve가 A~E로 줄 때 → 1~5번으로 매핑
         if ("ABCDE".includes(ans)) {
-          const map = { A:"에이", B:"비", C:"씨", D:"디", E:"이" };
-          spokenAns = map[ans] || ans;
+          const map = { A: 1, B: 2, C: 3, D: 4, E: 5 };
+          choiceNumber = map[ans] ?? null;
         }
+        // 혹시 이미 1~5로 들어오면 그대로 사용
+        else if ("12345".includes(ans)) {
+          choiceNumber = Number(ans);
+        }
+
+        let spokenAns;
+        if (choiceNumber != null) {
+          spokenAns = `${choiceNumber}번`;
+        } else {
+          // 예외 상황(문자 이상)에서는 그냥 원문 읽기
+          spokenAns = ans;
+        }
+
+        // "19번, 1번" 이런 식으로 읽음
         await speakNow(`${num}번, ${spokenAns}`);
         await sleep(1500); // 문항 사이 1.5초 정도 쉼
       }
