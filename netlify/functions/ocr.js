@@ -4,7 +4,6 @@
 // - env: OCR_SPACE_API_ENDPOINT (권장: https://apipro1.ocr.space/parse/image)
 // - env: OCR_SPACE_API_ENDPOINT_BACKUP (권장: https://apipro2.ocr.space/parse/image)
 // - env: OCR_SPACE_TIMEOUT_MS (옵션, 기본 30000)
-// - env: OCR_SPACE_LANGUAGE (옵션, 기본 "auto")  <-- 한국어/영어 같이 찍히면 auto 권장
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,6 +26,7 @@ function extractOcrResult(parsedJson) {
     const isErrored = !!parsedJson.IsErroredOnProcessing;
 
     if (exitCode !== 1 || isErrored) {
+      // OCR.Space가 에러라고 판단한 경우
       const msg =
         (parsedJson.ErrorMessage && parsedJson.ErrorMessage.join
           ? parsedJson.ErrorMessage.join("; ")
@@ -89,17 +89,18 @@ function extractOcrResult(parsedJson) {
   }
 }
 
-async function callOcrSpaceOnce(endpoint, apiKey, base64Image, timeoutMs, language) {
+async function callOcrSpaceOnce(endpoint, apiKey, base64Image, timeoutMs) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const params = new URLSearchParams();
+    // OCR.Space는 base64Image에 dataURL 전체("data:image/..;base64,...")를 기대함
     params.append("apikey", apiKey);
     params.append("base64Image", base64Image);
 
-    // ✅ 한국어 포함: language="auto" 권장 (Engine2에서 다국어 자동감지)
-    params.append("language", language || "auto");
+    // ✅ (수정된 1줄) 한국어 포함 인식을 위해 auto 사용
+    params.append("language", "auto");
 
     params.append("OCREngine", "2");
     params.append("scale", "true");
@@ -173,8 +174,6 @@ exports.handler = async (event) => {
       timeoutMs = 30000;
     }
 
-    const language = String(process.env.OCR_SPACE_LANGUAGE || "auto").trim() || "auto";
-
     let body = {};
     try {
       body = JSON.parse(event.body || "{}");
@@ -189,33 +188,33 @@ exports.handler = async (event) => {
       return json(400, { ok: false, error: "Missing image (dataURL base64)" });
     }
 
-    const base64Image = image.trim();
+    const base64Image = image.trim(); // 이미 data:image/...;base64,... 형식이라고 가정
 
     // 1차: primary endpoint
     const primary = await callOcrSpaceOnce(
       primaryEndpoint,
       apiKey,
       base64Image,
-      timeoutMs,
-      language
+      timeoutMs
     );
 
     let useResult = primary;
     let usedEndpoint = primaryEndpoint;
     let fromBackup = false;
 
+    // primary가 http 에러/타임아웃/JSON에러/exitCode 에러 등일 때 backup 시도
     let extractedPrimary = null;
     if (primary.httpOk && primary.json) {
       extractedPrimary = extractOcrResult(primary.json);
       if (!extractedPrimary.ok) {
+        // OCR.Space가 에러라고 판단한 경우만 backup 고려
         if (backupEndpoint && backupEndpoint !== primaryEndpoint) {
           await sleep(1000);
           const backup = await callOcrSpaceOnce(
             backupEndpoint,
             apiKey,
             base64Image,
-            timeoutMs,
-            language
+            timeoutMs
           );
           if (backup.httpOk && backup.json) {
             const extractedBackup = extractOcrResult(backup.json);
@@ -225,16 +224,20 @@ exports.handler = async (event) => {
               fromBackup = true;
               extractedPrimary = null;
             } else {
+              // backup도 OCR 실패 → 그대로 primary 기준으로 에러 리턴
               useResult = primary;
             }
           } else {
+            // backup도 HTTP/타임아웃 실패 → 그대로 primary 기준으로 에러 리턴
             useResult = primary;
           }
         }
       }
     }
 
+    // 최종 useResult를 기반으로 응답 만들기
     if (!useResult.httpOk) {
+      // HTTP 레벨 실패 / fetch 에러
       return json(200, {
         ok: false,
         error: "HTTP or fetch error when calling OCR.Space",
@@ -247,6 +250,7 @@ exports.handler = async (event) => {
     }
 
     if (!useResult.json) {
+      // JSON 파싱 실패
       return json(200, {
         ok: false,
         error: "Failed to parse OCR.Space JSON",
@@ -258,6 +262,7 @@ exports.handler = async (event) => {
       });
     }
 
+    // 실제 OCR 결과 추출
     const extracted = extractOcrResult(useResult.json);
     if (!extracted.ok) {
       return json(200, {
@@ -272,6 +277,7 @@ exports.handler = async (event) => {
       });
     }
 
+    // 성공: 기존처럼 ok:true + text. (meta/raw 는 추가 정보일 뿐)
     return json(200, {
       ok: true,
       text: extracted.text,
@@ -279,10 +285,11 @@ exports.handler = async (event) => {
       endpoint: usedEndpoint,
       fromBackup,
       meta: extracted.meta,
-      language,
+      // raw 전체는 로그 길이 방지를 위해 조금만 보냄 (필요시 늘려도 됨)
       raw: useResult.raw ? String(useResult.raw).slice(0, 2000) : null,
     });
   } catch (e) {
+    // 최상위 예외
     return json(200, {
       ok: false,
       error: "Unhandled error in ocr function",
