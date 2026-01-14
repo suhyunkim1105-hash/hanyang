@@ -37,6 +37,7 @@ You are an AI that answers Korean college transfer English multiple-choice exams
   • two-blank questions with paired choices like (A)-(E)
   • questions asking which one of (A)-(E) is contextually inappropriate in the passage
   • 제목 / 요지 / 주제 / 내용 일치·불일치
+  • “What does (A) refer to?”, “What does it/this/that mean?” 유형
 
 [Output format rules – MUST follow exactly]
 - One question per line.
@@ -54,7 +55,7 @@ You are an AI that answers Korean college transfer English multiple-choice exams
    - If a page only shows 13–17, then answer ONLY 13,14,15,16,17 for that page.
 3) For each question:
    - Collect its stem, any passage it depends on, and all its choices.
-   - Determine what the question is really asking (vocabulary, title, inference, NOT/EXCEPT, ordering, etc.).
+   - Determine what the question is really asking (vocabulary, title, inference, NOT/EXCEPT, ordering, reference (A), etc.).
    - Choose EXACTLY ONE best option.
 4) Always respect explicit instructions in the stem (“NOT”, “EXCEPT”, “INCORRECT”, “일치하지 않는 것”, etc.).
 5) For history/process/timeline questions (e.g., development of a technology, sequence of events in WWI, scientific discovery):
@@ -165,8 +166,6 @@ INTERNAL PROCEDURE:
      • the local sentence meaning, and
      • the overall thesis and tone of the passage.
 2) Mark as WRONG the word that creates a contradiction or clear illogic.
-   - Example pattern:
-     • If the passage describes a belief as widely held or long-lasting, a word meaning “minority” or “small, rare group” may be wrong.
 3) There should be exactly ONE clearly inappropriate word. Choose that one.
 
 ────────────────────────────────────
@@ -222,6 +221,36 @@ INTERNAL PROCEDURE:
    - The story or explanation reads naturally from start to finish.
 
 ────────────────────────────────────
+[Type 10: Reference / (A)(B) / pronoun questions]
+
+These ask “What does (A) refer to?” or “What does it/this/that/they mean in this context?”.
+
+INTERNAL PROCEDURE:
+1) Find the sentence that contains (A) or the pronoun, and also read at least the previous sentence.
+2) In your head, replace (A) / it / this / that / they with a short description (1–5 English words) that makes the sentence meaningful
+   (e.g., “our biggest competition”, “this phenomenon”, “such an attitude”).
+3) That description must match the logical role in the paragraph (subject, object, ‘our biggest competition’, etc.).
+4) For EACH choice, mentally substitute it into the place of (A) / it / this / that and check:
+   - Does the sentence still read naturally?
+   - Does it match the description from step 2 and the overall paragraph meaning?
+5) Never choose a noun only because it is physically closest in the text; always choose the option that matches the logical meaning.
+
+────────────────────────────────────
+[Type 11: Practical tip / strategy blank at the end of a paragraph]
+
+These are blanks where the last sentence gives a practical suggestion based on the previous experiment or description.
+
+INTERNAL PROCEDURE:
+1) Summarize the key result or rule from the sentences immediately before the blank
+   (e.g., “two intruders at once provoke more anger than one intruder”).
+2) The blank must directly express a strategy that uses that result
+   (e.g., “if you line-jump, do it alone”), not a general moral lesson.
+3) For EACH option, check:
+   - Does it explicitly connect to the key result in step 1?
+   - Does it fit the purpose of the passage (giving concrete tips, not vague advice)?
+4) Prefer options that are concrete implementations of the experimental finding, and reject options that only express generic politeness or morality.
+
+────────────────────────────────────
 [If information seems partial or OCR is noisy]
 
 - STILL choose exactly ONE answer per visible question number.
@@ -248,10 +277,15 @@ exports.handler = async (event) => {
       return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
     }
 
-    // 기본 모델: GPT-4.1 (환경변수 MODEL_NAME 으로 덮어쓰기 가능)
+    // 기본 모델: GPT 계열 (환경변수 MODEL_NAME 으로 덮어쓰기 가능)
+    // 정확도 우선이면 Netlify에서 MODEL_NAME="openai/gpt-5.1" 권장.
     const model = process.env.MODEL_NAME || "openai/gpt-4.1";
+
     const stopToken = process.env.STOP_TOKEN || "XURTH";
-    const temperature = Number(process.env.TEMPERATURE ?? 0.1);
+    // TEMPERATURE 환경변수 없으면 0으로 고정
+    const temperature = Number(
+      process.env.TEMPERATURE !== undefined ? process.env.TEMPERATURE : 0
+    );
 
     let body = {};
     try {
