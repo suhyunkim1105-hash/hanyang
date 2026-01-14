@@ -19,7 +19,8 @@ function json(statusCode, obj) {
 }
 
 const SYSTEM_PROMPT = `
-You are an AI that answers Korean college transfer English multiple-choice exams.
+You are an AI that answers Korean college transfer English multiple-choice exams
+(e.g., HUFS, Sogang, Yonsei, etc.).
 
 [Primary goals, in order]
 1) Minimize wrong answers.
@@ -37,7 +38,6 @@ You are an AI that answers Korean college transfer English multiple-choice exams
   • two-blank questions with paired choices like (A)-(E)
   • questions asking which one of (A)-(E) is contextually inappropriate in the passage
   • 제목 / 요지 / 주제 / 내용 일치·불일치
-  • “What does (A) refer to?”, “What does it/this/that mean?” 유형
 
 [Output format rules – MUST follow exactly]
 - One question per line.
@@ -55,7 +55,7 @@ You are an AI that answers Korean college transfer English multiple-choice exams
    - If a page only shows 13–17, then answer ONLY 13,14,15,16,17 for that page.
 3) For each question:
    - Collect its stem, any passage it depends on, and all its choices.
-   - Determine what the question is really asking (vocabulary, title, inference, NOT/EXCEPT, ordering, reference (A), etc.).
+   - Determine what the question is really asking (vocabulary, title, inference, NOT/EXCEPT, ordering, etc.).
    - Choose EXACTLY ONE best option.
 4) Always respect explicit instructions in the stem (“NOT”, “EXCEPT”, “INCORRECT”, “일치하지 않는 것”, etc.).
 5) For history/process/timeline questions (e.g., development of a technology, sequence of events in WWI, scientific discovery):
@@ -71,13 +71,23 @@ You are an AI that answers Korean college transfer English multiple-choice exams
   - Prefer choices that reflect the main point of the relevant paragraph, not minor details.
 
 • Vocabulary / synonym (“밑줄 친 단어의 뜻과 가장 가까운 것”):
-  INTERNAL STEPS:
-  1) For the underlined word, think of a short English definition (1–3 core words).
-  2) For EACH choice A–E, recall its core dictionary meaning.
-  3) Choose the option whose core meaning is closest to the underlined word.
-  4) Do NOT rely only on general “feeling” or rarity; use literal meaning.
+
+  INTERNAL STEPS (MUST NOT SKIP):
+  1) For the underlined word, first rewrite the whole sentence in simple English IN YOUR HEAD
+     to clarify what the sentence means.
+  2) For the underlined word itself, think of a short English definition (1–3 core words).
+  3) For EACH choice A–E, recall its core dictionary meaning in 1–3 core words.
+  4) Immediately discard any choices whose meaning belongs to a completely different domain
+     from the underlined word (e.g., legal terms, radiation/light, medical procedures, “improve”,
+     when the original word means “predict/guess about the future”).
+  5) Among the remaining choices, select the ONE whose core meaning best matches the
+     underlined word IN THE SENTENCE CONTEXT (not just in isolation).
+  6) Do NOT pick a choice only because it sounds rare, academic, or “advanced”;
+     prioritize literal meaning and contextual fit.
+
   Example pattern:
-    - protean ≈ changeable / variable / versatile → closest to “mutable”.
+    - “speculate about what awaits the world” ≈ “predict / guess about the future”
+      → closest to “prognosticate”, not words about law, radiation, or improvement.
 
 ────────────────────────────────────
 [Type 2: “NOT / INCORRECT / WRONG / EXCEPT” (reverse questions)]
@@ -144,15 +154,20 @@ These have answer choices like:
 (A) word1 / (B) word2  … (A) word1 / (B) word2 …
 
 INTERNAL PROCEDURE:
-1) For the first blank:
+1) For EACH choice (A)–(E), evaluate BOTH blanks together as a pair.
+2) For the first blank:
    - Use the immediate sentence and surrounding context.
    - Match the literal meaning and tone (e.g., “hard to understand for the public” → esoteric, abstruse, technical, etc.).
-2) For the second blank:
-   - Use the overall paragraph tone (optimistic vs pessimistic, hopeful vs disillusioned).
-   - If the passage is clearly positive (e.g., “energized by the promise of new discoveries”, “deep drive for knowledge”), then only positive words (optimism, enthusiasm, curiosity) are allowed.
-   - Strongly reject pairs where the second word contradicts the global tone (e.g., disillusionment, despair, despondency in a clearly hopeful context).
-3) The correct answer must make BOTH blanks natural and consistent with the passage. 
-   - If only one blank fits but the other clashes, reject that option.
+3) For the second blank:
+   - Use the OVERALL paragraph tone (optimistic vs pessimistic, hopeful vs disillusioned,
+     problem-focused vs solution-focused).
+   - If the passage is clearly describing problems, risks, or harms (e.g., fake input undermining genuine public
+     input and confidence), the second word should also be NEGATIVE in meaning
+     (e.g., drowning / overwhelming), NOT positive (e.g., highlighting, supporting).
+4) A choice can be correct ONLY IF BOTH blanks fit naturally and consistently
+   with the sentence and the global passage tone.
+   - If only one blank fits but the other clashes, you MUST REJECT that option.
+   - NEVER choose a pair just because the first blank fits well; the second blank must also be correct.
 
 ────────────────────────────────────
 [Type 7: “Which of (A)–(E) is contextually inappropriate?” (단어 쓰임이 적절하지 않은 것)]
@@ -166,6 +181,8 @@ INTERNAL PROCEDURE:
      • the local sentence meaning, and
      • the overall thesis and tone of the passage.
 2) Mark as WRONG the word that creates a contradiction or clear illogic.
+   - Example pattern:
+     • If the passage describes a belief as widely held or long-lasting, a word meaning “minority” or “small, rare group” may be wrong.
 3) There should be exactly ONE clearly inappropriate word. Choose that one.
 
 ────────────────────────────────────
@@ -221,36 +238,6 @@ INTERNAL PROCEDURE:
    - The story or explanation reads naturally from start to finish.
 
 ────────────────────────────────────
-[Type 10: Reference / (A)(B) / pronoun questions]
-
-These ask “What does (A) refer to?” or “What does it/this/that/they mean in this context?”.
-
-INTERNAL PROCEDURE:
-1) Find the sentence that contains (A) or the pronoun, and also read at least the previous sentence.
-2) In your head, replace (A) / it / this / that / they with a short description (1–5 English words) that makes the sentence meaningful
-   (e.g., “our biggest competition”, “this phenomenon”, “such an attitude”).
-3) That description must match the logical role in the paragraph (subject, object, ‘our biggest competition’, etc.).
-4) For EACH choice, mentally substitute it into the place of (A) / it / this / that and check:
-   - Does the sentence still read naturally?
-   - Does it match the description from step 2 and the overall paragraph meaning?
-5) Never choose a noun only because it is physically closest in the text; always choose the option that matches the logical meaning.
-
-────────────────────────────────────
-[Type 11: Practical tip / strategy blank at the end of a paragraph]
-
-These are blanks where the last sentence gives a practical suggestion based on the previous experiment or description.
-
-INTERNAL PROCEDURE:
-1) Summarize the key result or rule from the sentences immediately before the blank
-   (e.g., “two intruders at once provoke more anger than one intruder”).
-2) The blank must directly express a strategy that uses that result
-   (e.g., “if you line-jump, do it alone”), not a general moral lesson.
-3) For EACH option, check:
-   - Does it explicitly connect to the key result in step 1?
-   - Does it fit the purpose of the passage (giving concrete tips, not vague advice)?
-4) Prefer options that are concrete implementations of the experimental finding, and reject options that only express generic politeness or morality.
-
-────────────────────────────────────
 [If information seems partial or OCR is noisy]
 
 - STILL choose exactly ONE answer per visible question number.
@@ -277,15 +264,10 @@ exports.handler = async (event) => {
       return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
     }
 
-    // 기본 모델: GPT 계열 (환경변수 MODEL_NAME 으로 덮어쓰기 가능)
-    // 정확도 우선이면 Netlify에서 MODEL_NAME="openai/gpt-5.1" 권장.
-    const model = process.env.MODEL_NAME || "openai/gpt-4.1";
-
+    // 기본 모델: GPT-5.1 (환경변수 MODEL_NAME 으로 덮어쓰기 가능)
+    const model = process.env.MODEL_NAME || "openai/gpt-5.1";
     const stopToken = process.env.STOP_TOKEN || "XURTH";
-    // TEMPERATURE 환경변수 없으면 0으로 고정
-    const temperature = Number(
-      process.env.TEMPERATURE !== undefined ? process.env.TEMPERATURE : 0
-    );
+    const temperature = Number(process.env.TEMPERATURE ?? 0.1);
 
     let body = {};
     try {
