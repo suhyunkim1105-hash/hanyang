@@ -1,207 +1,244 @@
 // netlify/functions/solve.js
-
-// -------------------------
-// 역할: 편입 영어 객관식 기출 "정답만" 생성하는 함수 (3회 호출 + 다수결)
+// --------------------------------------
+// 역할: 편입 영어 객관식 기출 "정답만" 생성하는 함수 (멀티 프롬프트 + 다수결)
 // 입력: { ocrText: string, page?: number }
 // 출력: { ok: true, text: "1: A\n2: D\n...", debug: {...} } 또는 { ok: false, error: "..." }
 //
 // 필요한 환경변수 (Netlify 에서 설정):
 // - OPENROUTER_API_KEY  (필수)
 // - MODEL_NAME          (선택, 예: "openai/gpt-4.1", 기본값: "openai/gpt-4.1")
-// - STOP_TOKEN          (선택, 기본값: "XURTH")
+// - TEMPERATURE         (선택, 기본 0)
+// - STOP_TOKEN          (선택, 현재는 응답 텍스트에 별도로 사용하지 않음)
 
-// Netlify Node 18+ 에서는 global fetch 가 있지만,
-// 만약 없을 경우를 대비해 node-fetch 로 폴백.
-const fetchFn = (...args) => {
-  if (typeof fetch !== "undefined") return fetch(...args);
-  // eslint-disable-next-line global-require
-  return import("node-fetch").then(({ default: f }) => f(...args));
-};
+"use strict";
 
 function json(statusCode, obj) {
   return {
     statusCode,
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
+      "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
     },
     body: JSON.stringify(obj),
   };
 }
 
-const SYSTEM_PROMPT = `
-You are an AI that answers Korean college transfer English multiple-choice exams.
+// OpenRouter 호출 함수
+async function callOpenRouter({ apiKey, model, systemPrompt, userContent, temperature }) {
+  const url = "https://openrouter.ai/api/v1/chat/completions";
 
-[Primary goals, in order]
-1) Minimize wrong answers.
-2) Never skip a question number that appears in the text.
-3) Output only the final answer key in the required format.
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
+    ],
+    temperature,
+    max_tokens: 512,
+  };
 
-[Input]
-- OCR text of one or more exam pages.
-- The text can contain: question numbers, directions, passages, underlined words, and choices (A/B/C/D/E or ①②③④).
-- Question types include:
-  • normal comprehension / vocabulary / inference
-  • “Which is NOT / WRONG / INCORRECT / EXCEPT?”
-  • “Which underlined word is NOT correct?”
-  • ordering sentences or paragraphs (A/B/C style 단락 배열 포함)
-  • two-blank questions with paired choices like (A)-(E)
-  • questions asking which one of (A)-(E) is contextually inappropriate in the passage
-  • 제목 / 요지 / 주제 / 내용 일치·불일치
-
-[Output format rules – MUST follow exactly]
-- One question per line.
-- Format: "<number>: <capital letter>" (examples: "7: D", "19: B").
-- No explanations, no Korean, no extra text, no blank lines.
-- No other punctuation except colon and a single space.
-- Question numbers should be in ascending order if possible.
-- Exactly one answer for each visible question number.
-- If you are uncertain, you must STILL choose exactly one option.
-- For each question, use ONLY the choices that actually appear in the OCR text
-  (for example, if the question shows only A–D, you must NOT use E).
-
-[Global solving procedure – INTERNAL ONLY]
-1) Read the ENTIRE OCR text first to understand structure and passages.
-2) Scan for all clearly visible question numbers (1, 2, 3, …).
-   - Do NOT assume a continuous range. Only answer numbers that clearly appear in the text.
-   - If a page only shows 13–17, then answer ONLY 13,14,15,16,17 for that page.
-3) For each question:
-   - Collect its stem, any passage it depends on, and all its choices.
-   - Determine what the question is really asking (vocabulary, title, inference, NOT/EXCEPT, ordering, etc.).
-   - Choose EXACTLY ONE best option.
-4) Always respect explicit instructions in the stem (“NOT”, “EXCEPT”, “INCORRECT”, “일치하지 않는 것”, etc.).
-5) For history/process/timeline questions (e.g., development of a technology, sequence of events in WWI, scientific discovery):
-   - Carefully track chronological order: earliest → later → latest.
-   - Background explanation (general overview) usually goes BEFORE specific later events and improvements.
-
-────────────────────────────────────
-[Type 1: Normal comprehension / vocabulary / inference]
-
-• Comprehension / inference:
-  - Choose the option most strongly supported by the passage’s meaning, logic, and tone.
-  - Reject options that introduce new claims not supported by the text, even if they sound plausible.
-  - Prefer choices that reflect the main point of the relevant paragraph, not minor details.
-
-• Vocabulary / synonym (“밑줄 친 단어의 뜻과 가장 가까운 것”):
-  INTERNAL STEPS:
-  1) For the underlined word, think of a short English definition (1–3 core words).
-  2) For EACH choice A–E, recall its core dictionary meaning.
-  3) Choose the option whose core meaning is closest to the underlined word.
-  4) Do NOT rely only on general “feeling” or rarity; use literal meaning.
-
-────────────────────────────────────
-[Type 2: “NOT / INCORRECT / WRONG / EXCEPT” (reverse questions)]
-
-• Treat these as “find the FALSE statement” questions.
-
-INTERNAL PROCEDURE:
-1) For each choice A–E, classify it against the passage:
-   - TRUE = clearly stated, strongly implied, or naturally supported.
-   - FALSE = contradicts the passage OR lacks sufficient support.
-2) Mark EXACTLY ONE choice as FALSE. That FALSE choice is the correct answer.
-
-────────────────────────────────────
-[Type 3: “Which underlined word/phrase is NOT correct?”]
-
-• For each underlined expression:
-  - Check meaning AND grammar.
-
-────────────────────────────────────
-[Type 4: Reordering sentence questions (문장 배열)]
-────────────────────────────────────
-[Type 5: Inference questions (“What can be inferred…?”)]
-────────────────────────────────────
-[Type 6: Two-blank paired-choice questions (A/B, A/B in one option set)]
-────────────────────────────────────
-[Type 7: “Which of (A)–(E) is contextually inappropriate?”]
-────────────────────────────────────
-[Type 8: Title / Main idea / 요지 / 제목 / 주제]
-────────────────────────────────────
-[Type 9: Paragraph ordering / flow (단락 배열, (A)(B)(C) 순서)]
-────────────────────────────────────
-[If information seems partial or OCR is noisy]
-
-- STILL choose exactly ONE answer per visible question number.
-- Rely on lexical meaning, grammar, logic, and tone.
-
-[Two-phase internal check – VERY IMPORTANT]
-
-Phase 1: Solve all questions mentally and write a provisional answer key.
-Phase 2: Go BACK over every single question number again.
-  - Re-read its stem, passage, and choices.
-  - Ask: “Is this option definitely better than all others, given the passage?”
-  - If you find a better option, CORRECT your answer before outputting.
-
-[Final reminder]
-- Follow all output format rules strictly: only lines like “19: B”.
-- Do NOT include any other text or symbols.
-`;
-
-// -------------------------
-// OpenRouter 한 번 호출해서 정답 파싱하는 헬퍼
-// -------------------------
-async function callModelOnce({ apiKey, model, stopToken, temperature, userPrompt }) {
-  const res = await fetchFn("https://openrouter.ai/api/v1/chat/completions", {
+  const res = await fetch(url, {
     method: "POST",
     headers: {
+      "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "HTTP-Referer": "https://beamish-alpaca-e3df59.netlify.app",
-      "X-Title": "answer-site-solve-fn",
     },
-    body: JSON.stringify({
-      model,
-      temperature,
-      stop: [stopToken],
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT.trim() },
-        { role: "user", content: userPrompt },
-      ],
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter HTTP ${res.status}: ${text.slice(0, 500)}`);
+    throw new Error(`OpenRouter error: ${res.status} ${res.statusText} ${text}`);
   }
 
   const data = await res.json();
-  const raw = String(data.choices?.[0]?.message?.content || "").trim();
-  const finishReason = data.choices?.[0]?.finish_reason ?? null;
-
-  const cleaned = raw.split(stopToken)[0].trim();
-
-  const lines = cleaned
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-
-  const answers = {};
-  const questionNumbers = [];
-
-  for (const line of lines) {
-    const m = line.match(/^(\d+)\s*[:\-]\s*([A-E])(\?)?\s*$/i);
-    if (!m) continue;
-    const qNum = Number(m[1]);
-    const choice = m[2].toUpperCase();
-
-    answers[qNum] = choice;
-    questionNumbers.push(qNum);
+  const choice = data.choices && data.choices[0];
+  if (!choice || !choice.message || typeof choice.message.content !== "string") {
+    throw new Error("OpenRouter response format error");
   }
 
   return {
-    raw,
-    cleaned,
-    lines,
-    answers,
-    questionNumbers,
-    finishReason,
+    text: choice.message.content.trim(),
+    finishReason: choice.finish_reason || "stop",
   };
 }
 
-// -------------------------
-// 메인 handler
-// -------------------------
+// OCR 텍스트에서 문항 번호 추출
+function extractQuestionNumbers(ocrText) {
+  const nums = new Set();
+
+  // 가장 일반적인 패턴: "1." "2)" "24. "
+  const re = /(?:^|\s|\[)(\d{1,2})[.)](?=\s)/g;
+  let m;
+  while ((m = re.exec(ocrText)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 50) nums.add(n);
+  }
+
+  const arr = Array.from(nums);
+  arr.sort((a, b) => a - b);
+  return arr;
+}
+
+// 선택지 정규화: A/B/C/D 이외는 null 로 처리 (투표에서 제외)
+function normalizeChoice(ch) {
+  if (!ch) return null;
+  const upper = String(ch).trim().toUpperCase();
+  if (["A", "B", "C", "D"].includes(upper)) return upper;
+  return null;
+}
+
+// 모델 응답(문자열)에서 "번호: 선택지" 파싱
+function parseAnswersFromModelOutput(output, questionNumbers) {
+  const wanted = new Set(questionNumbers);
+  const answers = {};
+
+  const lines = output.split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // 패턴 1: "7: B" 또는 "7 - B" 등
+    let m = line.match(/^(\d{1,2})\s*[:\-]\s*([A-Za-z])/);
+    if (!m) continue;
+
+    const q = parseInt(m[1], 10);
+    if (!wanted.has(q)) continue;
+
+    const choice = normalizeChoice(m[2]);
+    if (!choice) continue;
+
+    // 같은 번호가 여러 번 나오면 첫 번째만 사용
+    if (answers[q] == null) {
+      answers[q] = choice;
+    }
+  }
+
+  return answers;
+}
+
+// 멀티 프롬프트 정의 (3개 관점)
+function buildPromptSpecs(stopToken) {
+  const stopInfo = stopToken
+    ? `\n- 절대 "${stopToken}" 같은 STOP 토큰은 출력하지 마라.`
+    : "";
+
+  // 공통 시스템 규칙 (각 프롬프트마다 포함할 핵심 규칙)
+  const commonRules = `
+너는 편입 영어 객관식 기출 문제를 푸는 전용 AI다.
+
+규칙:
+- 문제는 모두 4지선다형이며, 보기 A/B/C/D 네 개만 존재한다.
+- 정답은 반드시 대문자 A, B, C, D 중 하나여야 한다.
+- E, F 등의 보기는 존재하지 않으니 절대 사용하지 마라.
+- 주어진 문항번호 목록에 있는 번호는 모두 빠짐없이 정답을 내야 한다 (누락 금지).
+- 최종 출력 형식:
+  - 각 줄에 "번호: 선택지" 형태로만 출력 (예: "7: B").
+  - 다른 텍스트(해설, 이유, 설명, 요약, 문장)는 한 글자도 출력하지 마라.
+${stopInfo}
+`;
+
+  return [
+    {
+      roleName: "base",
+      systemPrompt:
+        commonRules +
+        `
+모드: 종합 풀이 모드
+- 문맥, 어휘, 문법, 논리를 모두 고려해서 가장 자연스럽고 출제 의도에 맞는 정답을 고른다.
+- 단, 출력 형식은 위 규칙을 반드시 지킨다.
+`,
+    },
+    {
+      roleName: "lexical",
+      systemPrompt:
+        commonRules +
+        `
+모드: 어휘/유의어 집중 모드
+- 밑줄 친 단어, 괄호 안 단어 등 어휘 문제에서 특히 정확한 의미 매칭에 집중하라.
+- 각 보기의 사전적 의미를 머릿속으로 비교하고, 문맥에 가장 정확히 들어맞는 것을 선택하라.
+- 동의어/반의어 문제, 어감 미묘한 차이 문제에서 실수하지 않도록 주의하라.
+- 출력 형식은 "번호: A/B/C/D"만 허용된다.
+`,
+    },
+    {
+      roleName: "logic",
+      systemPrompt:
+        commonRules +
+        `
+모드: 논리/함정 검증 모드
+- NOT, EXCEPT, INCORRECT, LEAST, MOST 등 함정 표현이 있는지 먼저 점검하라.
+- 문장 구조, 부정/이중부정, 조건문(if, unless), 비교/대조 등을 정교하게 따져서
+  논리적으로 반드시 맞는 선택지만 고르도록 한다.
+- 문맥상 부적절한 선택지를 철저히 배제하라.
+- 출력 형식은 "번호: A/B/C/D"만 허용된다.
+`,
+    },
+  ];
+}
+
+// user prompt 생성
+function buildUserPrompt(ocrText, questionNumbers) {
+  const numListStr = questionNumbers.join(", ");
+  return `
+다음은 어떤 대학교 편입 영어 객관식 시험지의 OCR 결과이다.
+
+- 이 OCR 텍스트 안에는 여러 문항(번호와 보기)이 포함되어 있다.
+- 너는 아래 "문항 번호 목록"에 포함된 모든 문항에 대해 정답을 골라야 한다.
+- 각 문항의 정답은 보기 A, B, C, D 중 하나다.
+- 최종 출력은 오직 "번호: 선택지" 형식의 줄들만 포함해야 한다.
+
+문항 번호 목록: ${numListStr}
+
+OCR 텍스트:
+"""
+${ocrText}
+"""
+
+위 정보를 바탕으로, 지정된 모든 문항 번호에 대한 정답만 계산해서 출력하라.
+`;
+}
+
+// 다수결 앙상블
+function majorityVote(questionNumbers, runs) {
+  const finalAnswers = {};
+  const voteDetail = {};
+
+  for (const q of questionNumbers) {
+    const counts = {};
+    for (const run of runs) {
+      const choice = run.answers[q];
+      if (!choice) continue;
+      counts[choice] = (counts[choice] || 0) + 1;
+    }
+
+    let bestChoice = null;
+    let bestCount = -1;
+
+    for (const [choice, cnt] of Object.entries(counts)) {
+      if (cnt > bestCount) {
+        bestChoice = choice;
+        bestCount = cnt;
+      }
+    }
+
+    // 투표가 하나도 없으면 base run 결과에 fallback, 그것도 없으면 A로.
+    if (!bestChoice) {
+      const baseRun = runs[0];
+      const fallback = baseRun && baseRun.answers[q];
+      finalAnswers[q] = normalizeChoice(fallback) || "A";
+    } else {
+      finalAnswers[q] = bestChoice;
+    }
+
+    voteDetail[q] = counts;
+  }
+
+  return { finalAnswers, voteDetail };
+}
+
+// Netlify handler
 exports.handler = async (event) => {
   try {
     if (event.httpMethod !== "POST") {
@@ -214,10 +251,9 @@ exports.handler = async (event) => {
     }
 
     const model = process.env.MODEL_NAME || "openai/gpt-4.1";
-    const stopToken = process.env.STOP_TOKEN || "XURTH";
-
-    // 🔒 온도 0으로 완전 고정 (ENV 무시)
-    const temperature = 0;
+    // 너가 요구한 대로 기본 0, 환경변수로 바꾸더라도 solve 로그에 그대로 찍히게만 함
+    const temperature = Number(process.env.TEMPERATURE ?? 0);
+    const stopToken = process.env.STOP_TOKEN || "";
 
     let body = {};
     try {
@@ -227,145 +263,75 @@ exports.handler = async (event) => {
     }
 
     const page = body.page ?? 1;
-    const ocrTextRaw = String(body.ocrText || body.text || "");
-    const ocrText = ocrTextRaw.trim();
+    const ocrText = String(body.ocrText || body.text || "");
 
-    if (!ocrText) {
-      return json(400, { ok: false, error: "Missing ocrText" });
+    if (!ocrText.trim()) {
+      return json(400, { ok: false, error: "ocrText is empty" });
     }
 
-    // 디버깅용: OCR에서 보이는 문제 번호 대략 추출
-    const visibleNumsSet = new Set();
-    const numberPattern = /(^|\n)\s*(\d{1,3})[.)]/g;
-    let m;
-    while ((m = numberPattern.exec(ocrText)) !== null) {
-      const n = Number(m[2]);
-      if (!Number.isNaN(n)) visibleNumsSet.add(n);
-    }
-    const visibleQuestionNumbers = Array.from(visibleNumsSet).sort((a, b) => a - b);
-
-    const userPrompt = [
-      "You will receive OCR text from an English multiple-choice exam.",
-      `Page: ${page}`,
-      "",
-      "OCR TEXT:",
-      ocrText,
-      "",
-      'Remember: output only lines in the exact format "number: LETTER".',
-      "Do NOT skip any question number that appears in the OCR text.",
-      "For each question, use ONLY the answer choices that actually appear in the OCR text for that question.",
-    ].join("\n");
-
-    const NUM_RUNS = 3;
-    const perRun = [];
-    const allQuestionSet = new Set();
-
-    for (let i = 0; i < NUM_RUNS; i++) {
-      try {
-        const result = await callModelOnce({
-          apiKey,
-          model,
-          stopToken,
-          temperature,
-          userPrompt,
-        });
-        perRun.push(result);
-        for (const q of result.questionNumbers) {
-          allQuestionSet.add(q);
-        }
-      } catch (err) {
-        perRun.push({
-          raw: "",
-          cleaned: "",
-          lines: [],
-          answers: {},
-          questionNumbers: [],
-          finishReason: `error: ${err && err.message ? err.message : "unknown"}`,
-        });
-      }
-    }
-
-    if (allQuestionSet.size === 0) {
-      const lastRaw = perRun[perRun.length - 1]?.raw || "";
-      return json(200, {
-        ok: true,
-        text: lastRaw,
-        debug: {
-          page,
-          model,
-          temperature,
-          visibleQuestionNumbers,
-          ensembleUsed: false,
-          reason: "noParsedAnswers",
-        },
+    const questionNumbers = extractQuestionNumbers(ocrText);
+    if (!questionNumbers.length) {
+      return json(400, {
+        ok: false,
+        error: "No question numbers detected in OCR text",
       });
     }
 
-    const finalAnswers = {};
-    const allQuestionNumbers = Array.from(allQuestionSet).sort((a, b) => a - b);
+    const promptSpecs = buildPromptSpecs(stopToken);
+    const userPrompt = buildUserPrompt(ocrText, questionNumbers);
 
-    for (const q of allQuestionNumbers) {
-      const freq = {};
-      for (const run of perRun) {
-        const choice = run.answers[q];
-        if (!choice) continue;
-        freq[choice] = (freq[choice] || 0) + 1;
-      }
+    const runs = [];
 
-      let bestChoice = null;
-      let bestCount = -1;
+    for (const spec of promptSpecs) {
+      const { roleName, systemPrompt } = spec;
+      const { text: modelText, finishReason } = await callOpenRouter({
+        apiKey,
+        model,
+        systemPrompt,
+        userContent: userPrompt,
+        temperature,
+      });
 
-      for (const [choice, count] of Object.entries(freq)) {
-        if (count > bestCount) {
-          bestCount = count;
-          bestChoice = choice;
-        }
-      }
+      const answers = parseAnswersFromModelOutput(modelText, questionNumbers);
 
-      if (!bestChoice) {
-        for (const run of perRun) {
-          const choice = run.answers[q];
-          if (choice) {
-            bestChoice = choice;
-            break;
-          }
-        }
-      }
-
-      if (bestChoice) {
-        finalAnswers[q] = bestChoice;
-      }
+      runs.push({
+        index: runs.length,
+        roleName,
+        questionNumbers,
+        answers,
+        finishReason,
+      });
     }
 
-    const outputLines = allQuestionNumbers
-      .filter((q) => finalAnswers[q])
-      .map((q) => `${q}: ${finalAnswers[q]}`);
+    const { finalAnswers, voteDetail } = majorityVote(questionNumbers, runs);
+
+    const lines = questionNumbers.map((q) => `${q}: ${finalAnswers[q]}`);
+    const outText = lines.join("\n");
+
+    const ocrPreview = ocrText.length > 400
+      ? ocrText.slice(0, 400)
+      : ocrText;
 
     return json(200, {
       ok: true,
-      text: outputLines.join("\n"),
+      text: outText,
       debug: {
         page,
         model,
         temperature,
-        visibleQuestionNumbers,
-        questionNumbers: allQuestionNumbers,
+        questionNumbers,
+        visibleQuestionNumbers: questionNumbers,
         answers: finalAnswers,
+        voteDetail,
         ensembleUsed: true,
-        runs: perRun.map((run, idx) => ({
-          index: idx,
-          questionNumbers: run.questionNumbers,
-          answers: run.answers,
-          finishReason: run.finishReason,
-        })),
-        ocrTextPreview: ocrText.slice(0, 400),
+        runs,
+        ocrTextPreview: ocrPreview,
       },
     });
   } catch (err) {
-    console.error("solve.js error", err);
     return json(500, {
       ok: false,
-      error: err && err.message ? err.message : "Unknown error in solve function",
+      error: err && err.message ? err.message : String(err),
     });
   }
 };
