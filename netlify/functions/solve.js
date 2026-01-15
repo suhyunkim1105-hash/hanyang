@@ -137,6 +137,20 @@ function buildPromptSpecs(stopToken) {
   - 각 줄에 "번호: 선택지" 형태로만 출력 (예: "7: B").
   - 다른 텍스트(해설, 이유, 설명, 요약, 문장)는 한 글자도 출력하지 마라.
 ${stopInfo}
+
+추가 규칙(문법/지시어 전용):
+- INCORRECT / NOT / EXCEPT / 적절하지 않은 것을 고르는 문항에서는
+  1) 각 밑줄/표지된 부분(①~④)만 따로 떼어 문장을 최소 수정으로 자연스럽게 고쳐본 뒤,
+  2) 가장 분명하게 문법 규칙을 어기거나 의미상 어색한 부분이 있는 번호를 고른다.
+- 'as to whether', 'no sooner ~ than', 'Hardly ~ when/than' 등 자주 쓰이는 관용 표현은
+  특별한 이유가 없으면 올바른 것으로 취급한다.
+- 대명사나 지시어(it, this, that, such, they, (A) 등)의 지칭 대상을 묻는 문항에서는
+  1) 해당 지시어가 포함된 문장을 앞뒤 문맥과 함께 한 문장으로 다시 풀어서 쓰고,
+  2) 그 문장이 가리키는 추상적인 대상/개념을 찾은 뒤,
+  3) 보기 중 의미가 가장 잘 대응되는 것을 고른다.
+- 예: "Our biggest competition is not A; it's not B. It's C."와 같이
+  "X is not A; it's not B. It's C." 구조가 나오면,
+  'it'이 가리키는 것은 A나 B가 아니라 'X(our biggest competition)'라는 추상적 대상이다.
 `;
 
   return [
@@ -147,7 +161,8 @@ ${stopInfo}
         `
 모드: 종합 풀이 모드
 - 문맥, 어휘, 문법, 논리를 모두 고려해서 가장 자연스럽고 출제 의도에 맞는 정답을 고른다.
-- 단, 출력 형식은 위 규칙을 반드시 지킨다.
+- 문법/어법 문제에서는 각 번호별 부분(①~④)을 따로 떼어 보고, 가장 명백한 오류가 있는 번호를 선택한다.
+- 출력 형식은 위 규칙을 반드시 지킨다.
 `,
     },
     {
@@ -171,6 +186,10 @@ ${stopInfo}
 - NOT, EXCEPT, INCORRECT, LEAST, MOST 등 함정 표현이 있는지 먼저 점검하라.
 - 문장 구조, 부정/이중부정, 조건문(if, unless), 비교/대조 등을 정교하게 따져서
   논리적으로 반드시 맞는 선택지만 고르도록 한다.
+- 지시어/대명사(it, this, that, such, they, (A) 등) 문제에서는,
+  지시어가 가리키는 문장 전체 의미(예: "our biggest competition")를 먼저 구한 다음,
+  보기들을 그 의미와 비교하여 가장 가까운 의미를 선택하라.
+  바로 앞에 나온 고유명사(예: Guggenheim 등)에 기계적으로 대응시키지 마라.
 - 문맥상 부적절한 선택지를 철저히 배제하라.
 - 출력 형식은 "번호: A/B/C/D"만 허용된다.
 `,
@@ -251,7 +270,7 @@ exports.handler = async (event) => {
     }
 
     const model = process.env.MODEL_NAME || "openai/gpt-4.1";
-    // 너가 요구한 대로 기본 0, 환경변수로 바꾸더라도 solve 로그에 그대로 찍히게만 함
+    // 기본 0, 환경변수로 바꾸더라도 solve 로그에 그대로 찍히게만 함
     const temperature = Number(process.env.TEMPERATURE ?? 0);
     const stopToken = process.env.STOP_TOKEN || "";
 
@@ -335,3 +354,4 @@ exports.handler = async (event) => {
     });
   }
 };
+
