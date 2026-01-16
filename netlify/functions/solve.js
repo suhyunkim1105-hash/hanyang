@@ -2,10 +2,10 @@
 // --------------------------------------
 // HUFS (한국외대) 편입 T2 영어 객관식 전용 정답 생성 함수
 // 입력: { ocrText: string, page?: number }
-// 출력: { ok: true, text: "1: C\n2: B...\nUNSURE: 7, 14" , debug: {...} }
-// - 선택지는 항상 A~D 중 하나만 사용 (외대 T2는 4지선다)
-// - 모델: 기본 openai/gpt-4.1, 온도는 항상 0으로 고정
-// - STOP_TOKEN 이 있으면 거기까지만 사용
+// 출력: { ok: true, text: "1: C\n2: B...\nUNSURE: 7, 14", debug: {...} }
+// - 선택지는 항상 A~D (4지선다)
+// - 모델: 기본 openai/gpt-4.1, 온도는 항상 0 (완전 결정적)
+// - UNSURE: 모델이 70% 미만 확신인 번호 목록
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -29,11 +29,11 @@ function safeParseBody(event) {
   }
 }
 
+// OCR 텍스트에서 보이는 문항 번호 추출
 function extractQuestionNumbers(ocrText) {
   const text = String(ocrText || "");
   const nums = new Set();
-  // 줄 시작의 "숫자." 또는 "숫자)" 패턴
-  const re = /(^|\n)\s*(\d{1,2})\s*[\.\)]\s/g;
+  const re = /(^|\n)\s*(\d{1,2})\s*[\.\)]\s/g; // 줄 시작의 "숫자." / "숫자)" 패턴
   let m;
   while ((m = re.exec(text)) !== null) {
     const n = Number(m[2]);
@@ -46,7 +46,7 @@ function normalizeChoice(ch) {
   if (!ch) return null;
   const c = String(ch).trim().toUpperCase();
   if (["A", "B", "C", "D"].includes(c)) return c;
-  // 혹시 1~4 로 온 경우 방어적으로 매핑
+  // 혹시 1~4로 올 경우 방어적으로 매핑
   if (c === "1") return "A";
   if (c === "2") return "B";
   if (c === "3") return "C";
@@ -54,13 +54,10 @@ function normalizeChoice(ch) {
   return null;
 }
 
-function parseAnswerLines(raw, stopToken) {
+// 모델이 출력한 텍스트에서 "번호: 선택지" 패턴 파싱 + UNSURE 라인 파싱
+function parseAnswerLines(raw) {
   if (!raw) return { answers: {}, unsure: [] };
   let text = String(raw);
-  if (stopToken) {
-    const idx = text.indexOf(stopToken);
-    if (idx >= 0) text = text.slice(0, idx);
-  }
 
   const answers = {};
   let unsure = [];
@@ -99,46 +96,55 @@ function parseAnswerLines(raw, stopToken) {
   return { answers, unsure };
 }
 
-async function callOpenRouter({ apiKey, model, stopToken, roleName, ocrText, questionNumbers, page }) {
+async function callOpenRouter({ apiKey, model, roleName, ocrText, questionNumbers, page }) {
   const baseSystem = `You are an AI that solves **HUFS (Hankuk University of Foreign Studies) transfer exam T2 English multiple-choice questions**.
 
-Rules (VERY IMPORTANT):
-- This exam is always 4-choice: options are A, B, C, D only.
+Global rules (VERY IMPORTANT):
+- This exam is ALWAYS 4-choice: options are A, B, C, D only.
 - Use the OCR text exactly as given. Do NOT invent or hallucinate text.
-- Answer **only** for the question numbers listed below. If some numbers are missing in OCR, skip them.
+- Answer ONLY for the question numbers listed below. If some numbers are missing in OCR, skip them.
 - Output format: one line per question -> "<number>: <choice>".
   - Example: "7: C"
   - <choice> must be exactly one of A, B, C, D.
 - At the end, add one more line: "UNSURE: n1, n2" listing question numbers where you are **not at least 70% confident**.
-  - If you are confident about all, write: "UNSURE: (none)".
+  - If you are confident about all answers, write exactly: "UNSURE: (none)".
 - Never add explanations, commentary, translations, or anything else.
 - NEVER change the question numbers; they must match the input question numbers.
 
 HUFS T2-specific guidance:
 - 1–4: choose the option that best completes the sentence (semantic + grammatical fit).
-- 5–13: vocabulary / meaning questions. Focus on the underlined word and its contextual meaning.
-- 14–17: paraphrase / sentence equivalence and grammar. Choose the option that best matches the logical meaning of the original sentence.
-- 18–21: "grammatically INCORRECT" / error-detection items. Pick the ONLY option that makes the sentence ungrammatical.
+- 5–13: vocabulary / contextual meaning questions. Focus on the **underlined word** in context.
+- 14–17: paraphrase / sentence equivalence and grammar. Choose the option that best matches the logical meaning AND is grammatically well-formed.
+- 18–19: "grammatically INCORRECT" (error-detection). The sentence includes (A), (B), (C), (D) marked phrases.
+  1) Treat EACH labeled phrase (A)(B)(C)(D) as a separate unit.
+  2) Internally classify each as "OK" or "ERROR" based ONLY on grammar, NOT style.
+  3) There is exactly ONE grammatically incorrect phrase; choose that one.
+  4) Pay extra attention to:
+     - redundant or unnecessary pronouns (especially "it", "they") that create double subjects or awkward clausal structure,
+     - wrong relative pronouns or complementizers.
+  5) Do NOT mark participle clauses like "constructed with novel methods ..." as incorrect if they can be integrated as reduced relative clauses.
+- 20–21: "grammatically INCORRECT" again. Use the same 1)–5) procedure above.
 - 22–25: reading-based questions (major topic, reference of pronouns/letters like (A)(B)(C)(D), best phrase for a blank, etc.).
+  - For questions like "Which of the following is different from the others in what it refers to?":
+    1) Explicitly determine the antecedent of each marker (A), (B), (C), and (D).
+    2) Choose the only one whose antecedent (referent) is different from the other three.
 - 26–30 and later: standard reading comprehension (inference, main idea, detail, etc.).
 
 Hard constraints:
-- If you are **forced to guess**, still output ONE best choice per question, then include that question number in UNSURE.
-- Do not ever output choices E, F, or numbers as choices.
-- Do not output any text after the answers and UNSURE line.
-${stopToken ? `- End your output with the exact token ${stopToken} on a new line.` : "" }
-`;
+- If you are FORCED TO GUESS, still output ONE best choice per question, then include that question number in the UNSURE list.
+- Do NOT ever output choices E, F, or numbers as choices.
+- Do NOT output any text after the answers and the UNSURE line.`;
 
   const roleHint = (() => {
     switch (roleName) {
       case "lexical":
         return "Focus extra on precise vocabulary, collocations, and subtle meaning differences between options.";
       case "logic":
-        return "Focus extra on logical structure, conditionals, contrast, cause/effect, and grammatical well-formedness.";
+        return "Focus extra on logical structure, conditionals, contrast, cause/effect, and overall coherence.";
       case "reading":
-        return "Focus extra on paragraph logic, discourse structure, and consistent interpretation across the whole passage.";
+        return "Focus extra on passage-level reasoning, global coherence, and consistency across sentences.";
       case "grammar":
-        return "Focus extra on pure grammar, especially for 'grammatically INCORRECT' questions (subject–verb agreement, tense, relative clauses, pronouns, articles).";
+        return "Focus extra on pure grammar, especially for 'grammatically INCORRECT' questions: subject–verb agreement, tense, clause structure, relative clauses, and pronoun usage (including redundant 'it').";
       default:
         return "Use a balanced approach over vocabulary, grammar, and reading comprehension.";
     }
@@ -161,7 +167,7 @@ OCR TEXT END
 
 Now output the answers strictly in the required format.`;
 
-  const temperature = 0; // 외대 전용: 항상 0으로 고정
+  const temperature = 0; // 외대 전용: 항상 0
 
   const body = {
     model,
@@ -171,10 +177,6 @@ Now output the answers strictly in the required format.`;
     ],
     temperature,
   };
-
-  if (stopToken) {
-    body.stop = [stopToken];
-  }
 
   const res = await fetch(OPENROUTER_API_URL, {
     method: "POST",
@@ -200,10 +202,11 @@ Now output the answers strictly in the required format.`;
   return { raw: content, finishReason };
 }
 
-async function ensembleSolve({ apiKey, model, stopToken, ocrText, page }) {
+// 여러 역할(base / lexical / logic / reading / grammar) 앙상블
+async function ensembleSolve({ apiKey, model, ocrText, page }) {
   const questionNumbers = extractQuestionNumbers(ocrText);
 
-  // 숫자를 하나도 못 찾으면, 외대 T2 패턴에 맞춰 대략 추정 (안전장치)
+  // 숫자를 못 찾았을 때 HUFS T2 패턴 기반 대략 추정 (안전장치)
   let visibleQuestionNumbers = questionNumbers;
   if (!visibleQuestionNumbers.length) {
     const fallback = [];
@@ -219,7 +222,6 @@ async function ensembleSolve({ apiKey, model, stopToken, ocrText, page }) {
 
   const roles = ["base", "lexical", "logic", "reading", "grammar"];
   const runs = [];
-
   const voteDetail = {}; // { [q]: { [choice]: count } }
 
   for (let i = 0; i < roles.length; i++) {
@@ -227,15 +229,13 @@ async function ensembleSolve({ apiKey, model, stopToken, ocrText, page }) {
     const { raw, finishReason } = await callOpenRouter({
       apiKey,
       model,
-      stopToken,
       roleName,
       ocrText,
       questionNumbers: visibleQuestionNumbers,
       page,
     });
 
-    const { answers } = parseAnswerLines(raw, stopToken);
-
+    const { answers } = parseAnswerLines(raw);
     const runQs = Object.keys(answers).map((x) => Number(x)).sort((a, b) => a - b);
 
     runs.push({
@@ -255,12 +255,10 @@ async function ensembleSolve({ apiKey, model, stopToken, ocrText, page }) {
     }
   }
 
-  // 최종 정답 선택 (다수결 + 불확실성 계산)
   const finalAnswers = {};
   const unsureList = [];
 
   const allQuestions = new Set(visibleQuestionNumbers);
-  // 모델이 추가로 답한 번호도 포함
   for (const qStr of Object.keys(voteDetail)) {
     allQuestions.add(Number(qStr));
   }
@@ -282,7 +280,6 @@ async function ensembleSolve({ apiKey, model, stopToken, ocrText, page }) {
     }
 
     if (!bestChoice) {
-      // 모든 러너가 답을 못 낸 경우: base 러너 결과에서 가져온다.
       const baseRun = runs[0];
       if (baseRun && baseRun.answers[q]) {
         bestChoice = baseRun.answers[q];
@@ -308,10 +305,7 @@ async function ensembleSolve({ apiKey, model, stopToken, ocrText, page }) {
     ? `UNSURE: ${unsureList.join(", ")}`
     : "UNSURE: (none)";
 
-  let text = answerLines.join("\n") + "\n" + unsureLine;
-  if (stopToken) {
-    text += "\n" + stopToken;
-  }
+  const text = answerLines.join("\n") + "\n" + unsureLine;
 
   return {
     text,
@@ -352,14 +346,12 @@ exports.handler = async (event) => {
     return json(400, { ok: false, error: "ocrText is empty" });
   }
 
-  const model = process.env.MODEL_NAME || "openai/gpt-4.1"; // 외대 전용: 기본 4.1
-  const stopToken = process.env.STOP_TOKEN || "XURTH";
+  const model = process.env.MODEL_NAME || "openai/gpt-4.1";
 
   try {
     const { text, debug } = await ensembleSolve({
       apiKey,
       model,
-      stopToken,
       ocrText,
       page,
     });
