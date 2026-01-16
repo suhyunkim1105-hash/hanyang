@@ -1,450 +1,524 @@
-// netlify/functions/solve.js
-// --------------------------------------
-// 역할: 한국외대(HUFS) 편입 영어 객관식 기출 "정답만" 생성하는 함수
-// - 대상: 한국외대 편입영어 T1 / T2 시험지 (50문항, 60분)
-// - 구조를 외대 전용으로 하드코딩해서 정확도 극대화
-//
-// 입력:  { ocrText: string, page?: number }
-// 출력:  { ok: true, text: "1: A\n2: D\n...", debug: {...} }
-// 실패:  { ok: false, error: "..." }
-//
-// 필요한 환경변수 (Netlify):
-// - OPENROUTER_API_KEY  (필수)
-// - MODEL_NAME          (선택, 기본 "openai/gpt-4.1")
-// - TEMPERATURE         (선택, 기본 0)
-// - STOP_TOKEN          (선택)
-
-"use strict";
-
-function json(statusCode, obj) {
-  return {
-    statusCode,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
-    body: JSON.stringify(obj),
-  };
-}
-
-// OpenRouter 호출 함수
-async function callOpenRouter({ apiKey, model, systemPrompt, userContent, temperature }) {
-  const url = "https://openrouter.ai/api/v1/chat/completions";
-
-  const body = {
-    model,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userContent },
-    ],
-    temperature,
-    max_tokens: 512,
-  };
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error: ${res.status} ${res.statusText} ${text}`);
-  }
-
-  const data = await res.json();
-  const choice = data.choices && data.choices[0];
-  if (!choice || !choice.message || typeof choice.message.content !== "string") {
-    throw new Error("OpenRouter response format error");
-  }
-
-  return {
-    text: choice.message.content.trim(),
-    finishReason: choice.finish_reason || "stop",
-  };
-}
-
-// 외대 전용: 문항 번호 → 유형 매핑
-function getQuestionType(q) {
-  if (q >= 1 && q <= 9) return "vocab_basic";          // 동의어
-  if (q >= 10 && q <= 13) return "vocab_context";      // 문맥상 동의어
-  if (q >= 14 && q <= 17) return "logic_sentence";     // 의미 동일/논리완성 계열
-  if (q >= 18 && q <= 21) return "grammar";            // 문법·재진술
-  if (q >= 22 && q <= 30) return "reading_short";      // 짧은 독해
-  if (q >= 31 && q <= 40) return "reading_mid";        // 중간 길이 독해 (2.5점)
-  if (q >= 41 && q <= 50) return "reading_long";       // 장문 독해 (3점)
-  return "unknown";
-}
-
-// 외대 전용: run별 가중치 설정
-function getRunWeight(roleName, q) {
-  const t = getQuestionType(q);
-
-  // 기본 가중치 1
-  let base = 1;
-
-  if (t === "vocab_basic" || t === "vocab_context") {
-    if (roleName === "lexical") base = 4;
-    else if (roleName === "base") base = 2;
-    else if (roleName === "logic") base = 1;
-    else if (roleName === "reading") base = 1;
-  } else if (t === "grammar") {
-    if (roleName === "logic") base = 4;
-    else if (roleName === "base") base = 2;
-    else if (roleName === "lexical") base = 1;
-    else if (roleName === "reading") base = 1;
-  } else if (t === "logic_sentence") {
-    if (roleName === "logic") base = 3;
-    else if (roleName === "reading") base = 3;
-    else if (roleName === "base") base = 2;
-    else if (roleName === "lexical") base = 1;
-  } else if (t === "reading_short" || t === "reading_mid") {
-    if (roleName === "reading") base = 4;
-    else if (roleName === "logic") base = 3;
-    else if (roleName === "base") base = 2;
-    else if (roleName === "lexical") base = 1;
-  } else if (t === "reading_long") {
-    // 41~50: 배점 최고, 실수 절대 금지 → reading/logic 강하게
-    if (roleName === "reading") base = 5;
-    else if (roleName === "logic") base = 4;
-    else if (roleName === "base") base = 3;
-    else if (roleName === "lexical") base = 1;
-  }
-
-  return base;
-}
-
-// OCR 텍스트에서 문항 번호 추출
-function extractQuestionNumbers(ocrText) {
-  const nums = new Set();
-
-  // 가장 일반적인 패턴: "1." "2)" "24. "
-  const re = /(?:^|\s|\[)(\d{1,2})[.)](?=\s)/g;
-  let m;
-  while ((m = re.exec(ocrText)) !== null) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 50) nums.add(n);
-  }
-
-  const arr = Array.from(nums);
-  arr.sort((a, b) => a - b);
-  return arr;
-}
-
-// 선택지 정규화: A/B/C/D 이외는 null 로 처리 (투표에서 제외)
-function normalizeChoice(ch) {
-  if (!ch) return null;
-  const upper = String(ch).trim().toUpperCase();
-  if (["A", "B", "C", "D"].includes(upper)) return upper;
-  return null;
-}
-
-// 모델 응답(문자열)에서 "번호: 선택지" 파싱
-function parseAnswersFromModelOutput(output, questionNumbers) {
-  const wanted = new Set(questionNumbers);
-  const answers = {};
-
-  const lines = output.split(/\r?\n/);
-
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-
-    // 패턴: "7: B" 또는 "7 - B"
-    const m = line.match(/^(\d{1,2})\s*[:\-]\s*([A-Za-z])/);
-    if (!m) continue;
-
-    const q = parseInt(m[1], 10);
-    if (!wanted.has(q)) continue;
-
-    const choice = normalizeChoice(m[2]);
-    if (!choice) continue;
-
-    if (answers[q] == null) {
-      answers[q] = choice;
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>answer-site</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:#0b1020; color:#e9eefc;
     }
-  }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
+    .card {
+      background:#0f1835;
+      border:1px solid rgba(255,255,255,.08);
+      border-radius: 18px;
+      padding: 16px;
+      margin-bottom: 14px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.25);
+    }
+    h2 { margin:0 0 10px 0; font-size: 18px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    button {
+      background:#2b6cff;
+      border:none;
+      color:white;
+      padding:10px 14px;
+      border-radius: 12px;
+      font-weight: 700;
+      cursor:pointer;
+      font-size: 13px;
+    }
+    button.secondary { background:#243055; }
+    button.danger { background:#b8234a; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    input {
+      background:#0b1020; color:#e9eefc;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius: 10px; padding:10px 12px;
+    }
+    .previewWrap {
+      height: 70vh;
+      min-height: 360px;
+      border-radius: 18px;
+      overflow:hidden;
+      background:#050a18;
+      border:1px solid rgba(255,255,255,.08);
+    }
+    video { width:100%; height:100%; object-fit: contain; background:#000; }
+    .hint { opacity:.8; font-size: 13px; line-height: 1.5; margin-top: 10px; }
+    pre {
+      margin:0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    textarea {
+      width:100%; min-height: 160px; resize: vertical;
+      background:#0b1020; color:#e9eefc;
+      border:1px solid rgba(255,255,255,.14);
+      border-radius: 12px; padding:12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+    }
+    .small { font-size: 12px; opacity: .85; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2>카메라 / 자동 문제풀이</h2>
+      <div class="row" style="margin-bottom:8px;">
+        <button id="btnStart">카메라 시작</button>
+        <button id="btnShot" class="secondary">현재 페이지 촬영</button>
+        <span class="small">현재 페이지</span>
+        <input id="page" type="number" value="1" min="1" style="width:90px" />
+        <span id="res" class="small"></span>
+      </div>
+      <div class="row" style="margin-bottom:8px;">
+        <button id="btnTtsTest" class="secondary">음성 테스트</button>
+        <button id="btnAutoStart">자동 문제풀이 시작</button>
+        <button id="btnAutoStop" class="danger">자동 문제풀이 정지</button>
+      </div>
 
-  return answers;
-}
+      <div class="previewWrap">
+        <video id="video" playsinline autoplay muted></video>
+      </div>
 
-// 멀티 프롬프트 정의 (4개 관점: base / lexical / logic / reading)
-function buildPromptSpecs(stopToken) {
-  const stopInfo = stopToken
-    ? `\n- 절대 "${stopToken}" 같은 STOP 토큰은 출력하지 마라.`
-    : "";
+      <div class="hint">
+        ① 시험지를 화면에 꽉 채우고<br/>
+        ② 글자/문항번호/보기(A~E)까지 선명하게 보이게 맞춘 뒤<br/>
+        ③ 자동 문제풀이를 켜면, 페이지마다<br/>
+        &nbsp;&nbsp;&nbsp;- <b>“페이지 인식, 1 2 3”</b> (예고 TTS)<br/>
+        &nbsp;&nbsp;&nbsp;- 촬영 → OCR → 정답 생성 → 정답 음성 낭독 순서로 반복.
+      </div>
+    </div>
 
-  const commonRules = `
-너는 한국외대(HUFS) 편입 영어 객관식 기출(T1/T2 전형)을 푸는 전용 AI다.
+    <!-- 정답 카드: 카메라 바로 아래로 이동 -->
+    <div class="card">
+      <h2>정답</h2>
+      <div class="small">정답은 "1: A" 같은 형식 + 마지막 줄에 UNSURE: ... 로 나옴. 음성으로도 읽어줌.</div>
+      <div style="height:10px"></div>
+      <textarea id="ansBox" placeholder="정답 결과가 여기에 표시됨" readonly></textarea>
+    </div>
 
-시험 정보:
-- 항상 50문항, 60분 시험이다.
-- 모든 문항은 4지선다형이며 보기 A/B/C/D 네 개만 존재한다.
-- 정답은 반드시 대문자 A, B, C, D 중 하나여야 한다.
-- 외대 편입 영어의 문항 범위/유형은 대략 다음과 같다.
-  * 1~9번    : 어휘/동의어
-  * 10~13번  : 문맥상 동의어
-  * 14~17번  : 의미 동일/논리완성 계열(문장 수준)
-  * 18~21번  : 문법/재진술 (INCORRECT·틀린 것 고르기 포함)
-  * 22~30번  : 짧은 독해
-  * 31~40번  : 중간 길이 독해 (보통 2.5점)
-  * 41~50번  : 장문 독해 (보통 3점, 난도·배점 최상)
+    <div class="card">
+      <h2>로그</h2>
+      <pre id="log"></pre>
+    </div>
 
-- 특히 31~50번, 그 중에서도 41~50번 독해 문제에서 실수하면 점수 손실이 크므로
-  이 구간에서는 절대로 대충 추론하지 말고, 지문 전체 내용을 꼼꼼히 이해한 뒤 답을 고른다.
+    <div class="card">
+      <h2>OCR 원문 확인</h2>
+      <div class="small">여기서 OCR이 얼마나 제대로 뽑혔는지 즉시 확인해. (정답률의 핵심)</div>
+      <div style="height:10px"></div>
+      <textarea id="ocrBox" placeholder="OCR 결과가 여기에 표시됨" readonly></textarea>
+    </div>
+  </div>
 
-공통 출력 규칙:
-- 주어진 문항번호 목록에 있는 번호는 모두 빠짐없이 정답을 내야 한다 (누락 금지).
-- 최종 출력 형식:
-  - 각 줄에 "번호: 선택지" 형태로만 출력 (예: "7: B").
-  - 다른 텍스트(해설, 이유, 설명, 요약, 문장)는 한 글자도 출력하지 마라.
-- 보기 E, F 등은 존재하지 않으니 절대 사용하지 마라.
-${stopInfo}
+  <script>
+    const $ = (id) => document.getElementById(id);
 
-지시어/논리 관련 추가 규칙:
-- NOT, NO, EXCEPT, LEAST, FALSE, INCORRECT, NOT TRUE 같은 단어가
-  문제나 선지 조건에 포함되어 있는지 먼저 확인한다.
-  * 이런 단어가 있으면 "지문과 일치하지 않는 것 / 가장 덜 지지되는 것"을 고르는 문제일 수 있다.
-- 지시어/대명사(it, this, that, those, they, such, former, latter, (A)~(E) 등)를 묻는 문제에서는
-  1) 해당 지시어가 들어 있는 문장과 그 앞뒤 문장을 한 덩어리로 묶어
-     그 덩어리가 설명하는 대상(예: wild bears, captive bears, poachers, rescuers 등)을
-     한 구나 한 문장으로 요약하고,
-  2) 보기마다 가리키는 대상을 동일한 방식으로 요약한 뒤,
-  3) 의미가 같은 것 / 다른 것 / 가장 적절한 것을 골라야 하는지 문제 지시에 맞게 선택한다.
-- 바로 앞에 나온 고유명사에 기계적으로 연결하지 말고,
-  문단 전체 흐름 속에서 어떤 집단/개념을 가리키는지 먼저 파악하라.
-`;
+    const video   = $("video");
+    const logEl   = $("log");
+    const ocrBox  = $("ocrBox");
+    const ansBox  = $("ansBox");
+    const btnShot = $("btnShot");
+    const btnStart = $("btnStart");
+    const btnTtsTest = $("btnTtsTest");
+    const btnAutoStart = $("btnAutoStart");
+    const btnAutoStop  = $("btnAutoStop");
+    const resEl  = $("res");
 
-  return [
-    {
-      roleName: "base",
-      systemPrompt:
-        commonRules +
-        `
-모드: 종합 풀이 모드
-- 어휘, 문법, 논리, 독해를 전체적으로 고려해 가장 자연스럽고 출제 의도에 맞는 정답을 고른다.
-- 문법/어법 문제에서는 각 번호별 부분(①~④ 등)을 따로 떼어 보고,
-  가장 명백한 문법 오류가 있는 보기를 선택한다.
-- 출력 형식은 반드시 "번호: A/B/C/D"만 사용한다.
-`,
-    },
-    {
-      roleName: "lexical",
-      systemPrompt:
-        commonRules +
-        `
-모드: 어휘/유의어 집중 모드
-- 1~13번 영역(어휘·문맥상 동의어)에서 특히 정확한 의미 매칭에 집중하라.
-- 각 보기의 사전적 의미와 실제 용례를 머릿속으로 비교하고,
-  문맥에 완전히 들어맞는 표현만 정답으로 인정한다.
-- 어감·콜로케이션이 어색한 선택지는 과감히 배제한다.
-- 출력 형식은 "번호: A/B/C/D"만 허용된다.
-`,
-    },
-    {
-      roleName: "logic",
-      systemPrompt:
-        commonRules +
-        `
-모드: 논리/문법/함정 검증 모드
-- 14~21번 영역(논리완성·문법/재진술)과 독해 전반에서
-  NOT, EXCEPT, LEAST, INCORRECT, FALSE 등의 함정 표현을 먼저 점검한다.
-- 문장 구조, 부정/이중부정, 조건문(if, unless), 비교/대조,
-  그리고 문법 규칙(수일치, 시제, 태, 관계사, 전치사, 관사 등)을 정교하게 따져서
-  논리적으로 반드시 맞는 선택지만 남긴다.
-- 지시어/대명사 문제에서는 지문 전체 흐름 속에서
-  "어떤 집단/개념"을 가리키는지 먼저 파악한 뒤 보기를 비교하라.
-- 출력 형식은 "번호: A/B/C/D"만 허용된다.
-`,
-    },
-    {
-      roleName: "reading",
-      systemPrompt:
-        commonRules +
-        `
-모드: 독해/요지 파악 전용 모드
-- 각 지문(한 단락 또는 여러 단락으로 이루어진 글)에 대해
-  1) 문단별 역할(도입, 설명, 예시, 반론, 결론)을 구분하고,
-  2) 2~3문장으로 전체 요지를 머릿속으로 요약한 뒤,
-  3) 각 보기가 그 요지와 "완전 일치 / 부분 일치 / 모순" 중 어디에 해당하는지 판정한다.
-- 맞는 것을 고르는 문제에서는 지문이 가장 강하게 지지하는 보기를,
-  NOT/EXCEPT/LEAST/FALSE 문제에서는 지문이 거의 지지하지 않는 보기를 선택한다.
-- 35~37, 45~47, 49~50번처럼 여러 문항이 한 지문에 묶여 있을 때는
-  첫 번째 문항에서 정확히 요지를 정리해 두고,
-  이후 문항을 풀 때 항상 그 요지와 연결해서 판단한다.
-- 절대로 자신의 배경지식이나 일반 상식을 근거로 답을 고르지 말고,
-  반드시 "지문이 직접 말한 내용" 또는 "지문에서 명확히 추론되는 내용"만 사용한다.
-- 출력 형식은 "번호: A/B/C/D"만 허용된다.
-`,
-    },
-  ];
-}
-
-// user prompt 생성 (외대 전용 설명 포함)
-function buildUserPrompt(ocrText, questionNumbers) {
-  const numListStr = questionNumbers.join(", ");
-  return `
-다음은 한국외대(HUFS) 편입 영어 객관식 시험지(T1 또는 T2)의 OCR 결과이다.
-
-- 이 텍스트에는 1번부터 50번까지의 문항과 보기(A~D)가 포함되어 있다.
-- 너는 아래 "문항 번호 목록"에 포함된 모든 문항에 대해 정답을 골라야 한다.
-- 각 문항의 정답은 보기 A, B, C, D 중 하나다.
-- 외대 편입 영어는 보통 앞쪽 번호(1~21)는 어휘/문법, 뒤쪽 번호(22~50)는 독해 문제이며,
-  31번 이후, 특히 41~50번은 긴 독해 + 높은 배점이므로 실수하면 안 된다.
-- 최종 출력은 오직 "번호: 선택지" 형식의 줄들만 포함해야 한다.
-
-문항 번호 목록: ${numListStr}
-
-OCR 텍스트 (한국어 설명 등은 이미 제거된 상태이며, 주로 영어·숫자·기호만 남아 있다):
-"""
-${ocrText}
-"""
-
-위 정보를 바탕으로, 지정된 모든 문항 번호에 대한 정답만 계산해서 출력하라.
-`;
-}
-
-// 가중치 다수결 앙상블 (외대 전용)
-function majorityVote(questionNumbers, runs) {
-  const finalAnswers = {};
-  const voteDetail = {};
-
-  for (const q of questionNumbers) {
-    const counts = {};
-    for (const run of runs) {
-      const choice = run.answers[q];
-      if (!choice) continue;
-      const w = getRunWeight(run.roleName, q);
-      counts[choice] = (counts[choice] || 0) + w;
+    function ts() {
+      const d = new Date();
+      const hh = String(d.getHours()).padStart(2,"0");
+      const mm = String(d.getMinutes()).padStart(2,"0");
+      const ss = String(d.getSeconds()).padStart(2,"0");
+      return `${hh}:${mm}:${ss}`;
     }
 
-    let bestChoice = null;
-    let bestScore = -1;
+    function log(msg) {
+      logEl.textContent += `[${ts()}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
 
-    for (const [choice, score] of Object.entries(counts)) {
-      if (score > bestScore) {
-        bestChoice = choice;
-        bestScore = score;
+    let stream = null;
+    let busy = false;       // 수동 촬영 락
+    let autoMode = false;   // 자동 모드 on/off
+    let autoTimer = null;
+    let lastOcrNonEmpty = false; // 직전 자동 OCR에서 글자가 있었는지
+    let wakeLock = null;
+
+    // ---- 공통 유틸 ----
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    // ---- 카메라 ----
+    async function startCamera() {
+      if (stream) return;
+
+      log("STATUS: 카메라를 켜고, 페이지 1부터 한 페이지씩 촬영해.");
+
+      const constraints = {
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width:  { min: 1280, ideal: 1920 },
+          height: { min: 720,  ideal: 1080 },
+        }
+      };
+
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+
+      await new Promise((r) => {
+        video.onloadedmetadata = () => r();
+      });
+
+      try {
+        const track = stream.getVideoTracks()[0];
+        await track.applyConstraints({
+          advanced: [
+            { width: 1920, height: 1080 },
+            { width: 1280, height: 720 }
+          ]
+        });
+      } catch (_) {}
+
+      setTimeout(() => {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        resEl.textContent = vw && vh ? `캠 해상도: ${vw}×${vh}` : "";
+        log("STATUS: 카메라가 켜졌어. 시험지를 화면에 꽉 차게 맞춰줘.");
+      }, 200);
+    }
+
+    function captureDataURL() {
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) throw new Error("Video not ready");
+
+      const canvas = document.createElement("canvas");
+      canvas.width = vw;
+      canvas.height = vh;
+
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, vw, vh);
+
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+      return { dataUrl, vw, vh, length: dataUrl.length };
+    }
+
+    async function doOCR(page, dataUrl) {
+      const res = await fetch("/.netlify/functions/ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ page, image: dataUrl }),
+      });
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok && data.ok, ...data };
+    }
+
+    async function doSolve(page, ocrText) {
+      const res = await fetch("/.netlify/functions/solve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ page, ocrText }),
+      });
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok && data.ok, ...data };
+    }
+
+    // ---- Wake Lock (화면 꺼짐 방지) ----
+    async function enableWakeLock() {
+      try {
+        if ("wakeLock" in navigator && !wakeLock) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          wakeLock.addEventListener("release", () => {
+            log("STATUS: 화면 꺼짐 방지(wake lock) 해제됨.");
+            wakeLock = null;
+          });
+          log("STATUS: 화면 꺼짐 방지(wake lock) 설정됨.");
+        }
+      } catch (e) {
+        log(`STATUS: wake lock 설정 실패: ${e?.message || e}`);
       }
     }
 
-    if (!bestChoice) {
-      // 투표가 하나도 없으면 base run 결과에 fallback, 그것도 없으면 A로.
-      const baseRun = runs.find((r) => r.roleName === "base") || runs[0];
-      const fallback = baseRun && baseRun.answers[q];
-      finalAnswers[q] = normalizeChoice(fallback) || "A";
-    } else {
-      finalAnswers[q] = bestChoice;
+    async function disableWakeLock() {
+      try {
+        if (wakeLock) {
+          await wakeLock.release();
+          wakeLock = null;
+          log("STATUS: 화면 꺼짐 방지(wake lock) 해제됨.");
+        }
+      } catch (e) {
+        // 무시
+      }
     }
 
-    voteDetail[q] = counts;
-  }
+    // ---- TTS ----
+    let ttsEnabled = false;
 
-  return { finalAnswers, voteDetail };
-}
-
-// Netlify handler (외대 전용)
-exports.handler = async (event) => {
-  try {
-    if (event.httpMethod !== "POST") {
-      return json(405, { ok: false, error: "POST only" });
-    }
-
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-      return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
-    }
-
-    const model = process.env.MODEL_NAME || "openai/gpt-4.1";
-    const temperature = Number(process.env.TEMPERATURE ?? 0); // 기본 0
-    const stopToken = process.env.STOP_TOKEN || "";
-
-    let body = {};
-    try {
-      body = JSON.parse(event.body || "{}");
-    } catch {
-      return json(400, { ok: false, error: "Invalid JSON body" });
-    }
-
-    const page = body.page ?? 1;
-
-    // 1) 원본 OCR 텍스트
-    const rawText = String(body.ocrText || body.text || "");
-
-    if (!rawText.trim()) {
-      return json(400, { ok: false, error: "ocrText is empty" });
-    }
-
-    // 2) 외대 전용: 한글 제거 (영어/숫자/기호 위주로 정리)
-    const ocrText = rawText.replace(/[가-힣ㄱ-ㅎㅏ-ㅣ]+/g, " ");
-
-    // 3) 문항 번호 추출
-    let questionNumbers = extractQuestionNumbers(ocrText);
-    if (!questionNumbers.length) {
-      return json(400, {
-        ok: false,
-        error: "No question numbers detected in OCR text",
+    function speakNow(text) {
+      return new Promise((resolve) => {
+        if (!("speechSynthesis" in window)) return resolve();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = "ko-KR";  // 유사 '유나' 스타일 한국어 여성 보이스 선택될 가능성↑
+        utter.rate = 1.0;
+        utter.pitch = 1.0;
+        utter.onend = () => resolve();
+        utter.onerror = () => resolve();
+        window.speechSynthesis.speak(utter);
       });
     }
 
-    const promptSpecs = buildPromptSpecs(stopToken);
-    const userPrompt = buildUserPrompt(ocrText, questionNumbers);
-
-    const runs = [];
-
-    for (const spec of promptSpecs) {
-      const { roleName, systemPrompt } = spec;
-      const { text: modelText, finishReason } = await callOpenRouter({
-        apiKey,
-        model,
-        systemPrompt,
-        userContent: userPrompt,
-        temperature,
-      });
-
-      const answers = parseAnswersFromModelOutput(modelText, questionNumbers);
-
-      runs.push({
-        index: runs.length,
-        roleName,
-        questionNumbers,
-        answers,
-        finishReason,
-      });
+    async function speakTest() {
+      ttsEnabled = true;
+      await speakNow("테스트");
+      log("STATUS: 음성 테스트를 재생했어. 이후 자동 풀이 정답도 소리로 읽어줄게.");
     }
 
-    const { finalAnswers, voteDetail } = majorityVote(questionNumbers, runs);
+    // ★ 여기: 페이지 인식 1 2 3 (예고용)
+    async function speakPageCountdown() {
+      if (!ttsEnabled) return;
+      await speakNow("페이지 인식, 일");
+      await sleep(400);
+      await speakNow("이");
+      await sleep(400);
+      await speakNow("삼");
+    }
 
-    const lines = questionNumbers.map((q) => `${q}: ${finalAnswers[q]}`);
-    const outText = lines.join("\n");
+    function parseSolveTextForTts(text) {
+      const items = [];
+      let unsureList = [];
 
-    const ocrPreview = ocrText.length > 400 ? ocrText.slice(0, 400) : ocrText;
+      const lines = String(text || "").split(/\r?\n/);
+      for (const raw of lines) {
+        const ln = raw.trim();
+        if (!ln) continue;
 
-    return json(200, {
-      ok: true,
-      text: outText,
-      debug: {
-        page,
-        model,
-        temperature,
-        questionNumbers,
-        visibleQuestionNumbers: questionNumbers,
-        answers: finalAnswers,
-        voteDetail,
-        ensembleUsed: true,
-        runs,
-        ocrTextPreview: ocrPreview,
-      },
+        let m = ln.match(/^(\d{1,3})\s*:\s*([A-E]|[1-5])\b/i);
+        if (m) {
+          const num = Number(m[1]);
+          const ans = m[2].toUpperCase();
+          items.push({ num, ans });
+          continue;
+        }
+        m = ln.match(/^UNSURE\s*:\s*(.+)$/i);
+        if (m) {
+          const parts = m[1].split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+          unsureList = parts.map(x => Number(x)).filter(n => !isNaN(n));
+        }
+      }
+      return { items, unsure: unsureList };
+    }
+
+    // ★ 여기만 수정: ABCDE를 숫자(1~5)로 읽도록 변경
+    async function speakAnswers(text) {
+      if (!ttsEnabled) return;
+      const { items, unsure } = parseSolveTextForTts(text);
+
+      for (const { num, ans } of items) {
+        let choiceNumber = null;
+
+        // solve가 A~E로 줄 때 → 1~5번으로 매핑
+        if ("ABCDE".includes(ans)) {
+          const map = { A: 1, B: 2, C: 3, D: 4, E: 5 };
+          choiceNumber = map[ans] ?? null;
+        }
+        // 혹시 이미 1~5로 들어오면 그대로 사용
+        else if ("12345".includes(ans)) {
+          choiceNumber = Number(ans);
+        }
+
+        let spokenAns;
+        if (choiceNumber != null) {
+          spokenAns = `${choiceNumber}번`;
+        } else {
+          // 예외 상황(문자 이상)에서는 그냥 원문 읽기
+          spokenAns = ans;
+        }
+
+        // "19번, 1번" 이런 식으로 읽음
+        await speakNow(`${num}번, ${spokenAns}`);
+        await sleep(1500); // 문항 사이 1.5초 정도 쉼
+      }
+
+      if (unsure.length) {
+        await speakNow(`불확실한 번호, ${unsure.join(", ")}`);
+        await sleep(1500);
+      }
+    }
+
+    // ---- 수동 촬영 ----
+    btnStart.addEventListener("click", async () => {
+      try {
+        await startCamera();
+        await enableWakeLock();
+      } catch (e) {
+        log(`STATUS: 카메라 실패: ${e?.message || e}`);
+      }
     });
-  } catch (err) {
-    return json(500, {
-      ok: false,
-      error: err && err.message ? err.message : String(err),
-    });
-  }
-};
 
+    btnShot.addEventListener("click", async () => {
+      if (busy) return;
+      busy = true;
+      btnShot.disabled = true;
+
+      try {
+        await startCamera();
+
+        const page = Number($("page").value || 1);
+
+        log(`STATUS: 페이지 ${page} 촬영 중... 시험지를 흔들리지 않게 잡고 있어줘.`);
+        const cap = captureDataURL();
+        log(`capture size ${JSON.stringify({ width: cap.vw, height: cap.vh, length: Math.floor(cap.length/4) })}`);
+
+        log("STATUS: OCR 처리 중...");
+        const ocr = await doOCR(page, cap.dataUrl);
+        log(`OCR response ${JSON.stringify(ocr).slice(0, 1200)}`);
+
+        if (!ocr.ok) {
+          log(`STATUS: OCR 실패: ${ocr.error || "Unknown"}${ocr.detail ? " / " + ocr.detail : ""}`);
+          return;
+        }
+
+        ocrBox.value = ocr.text || "";
+
+        log(`STATUS: OCR 완료 (평균 신뢰도: ${ocr.conf ?? 0}, 번호 패턴 수: ${ocr.hits ?? 0}). 이제 정답을 생성할게.`);
+        const solved = await doSolve(page, ocr.text || "");
+        log(`solve response ${JSON.stringify(solved).slice(0, 1200)}`);
+
+        if (!solved.ok) {
+          log(`STATUS: solve 실패: ${solved.error || "Unknown"}`);
+          if (ttsEnabled) await speakNow("실패");
+          return;
+        }
+
+        ansBox.value = solved.text || "";
+        log(`STATUS: 페이지 ${page} 정답을 생성했어.`);
+        await speakAnswers(solved.text || "");
+      } catch (e) {
+        log(`STATUS: 처리 실패: ${e?.message || e}`);
+      } finally {
+        busy = false;
+        btnShot.disabled = false;
+      }
+    });
+
+    // ---- 자동 문제풀이 ----
+    const AUTO_EMPTY_RETRY_MS = 4000;
+    const AUTO_AFTER_SOLVE_MS = 5000;
+
+    function scheduleAutoStep(delayMs) {
+      if (!autoMode) return;
+      if (autoTimer) clearTimeout(autoTimer);
+      autoTimer = setTimeout(() => {
+        autoStep().catch((e) => {
+          log(`STATUS: [자동] 처리 실패: ${e?.message || e}`);
+          scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
+        });
+      }, delayMs);
+    }
+
+    async function autoStep() {
+      if (!autoMode) return;
+      const page = Number($("page").value || 1);
+
+      // ★ 이미 한 번 이상 텍스트가 인식된 이후에는, 다음 촬영 전에 "페이지 인식 1 2 3" 예고
+      if (lastOcrNonEmpty) {
+        log("STATUS: [자동] 페이지 인식 1 2 3 (예고).");
+        await speakPageCountdown();
+      }
+
+      log(`STATUS: [자동] 페이지 ${page} 촬영 중... 시험지를 흔들리지 않게 잡고 있어줘.`);
+      const cap = captureDataURL();
+      log(`capture size ${JSON.stringify({ width: cap.vw, height: cap.vh, length: Math.floor(cap.length/4) })}`);
+
+      log("STATUS: [자동] OCR 처리 중...");
+      const ocr = await doOCR(page, cap.dataUrl);
+      log(`OCR response ${JSON.stringify(ocr).slice(0, 1200)}`);
+
+      if (!ocr.ok) {
+        log(`STATUS: [자동] OCR 실패: ${ocr.error || "Unknown"}${ocr.detail ? " / " + ocr.detail : ""}`);
+        if (ttsEnabled) await speakNow("실패");
+        scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
+        return;
+      }
+
+      const text = (ocr.text || "").trim();
+      if (!text) {
+        lastOcrNonEmpty = false;
+        log("STATUS: [자동] 아직 인식할 시험지가 없는 것 같아. 잠시 후 다시 시도할게.");
+        scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
+        return;
+      }
+
+      lastOcrNonEmpty = true;
+      ocrBox.value = ocr.text || "";
+      log(`STATUS: [자동] OCR 완료 (평균 신뢰도: ${ocr.conf ?? 0}, 번호 패턴 수: ${ocr.hits ?? 0}). 이제 정답을 생성할게.`);
+
+      const solved = await doSolve(page, ocr.text || "");
+      log(`solve response ${JSON.stringify(solved).slice(0, 1200)}`);
+
+      if (!solved.ok) {
+        log(`STATUS: [자동] solve 실패: ${solved.error || "Unknown"}`);
+        if (ttsEnabled) await speakNow("실패");
+        scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
+        return;
+      }
+
+      ansBox.value = solved.text || "";
+      log(`STATUS: [자동] 페이지 ${page} 정답을 생성했어.`);
+
+      await speakAnswers(solved.text || "");
+
+      // 다음 페이지/동일 페이지 다시 인식까지 5초 쉼
+      scheduleAutoStep(AUTO_AFTER_SOLVE_MS);
+    }
+
+    btnAutoStart.addEventListener("click", async () => {
+      if (autoMode) return;
+      try {
+        await startCamera();
+        await enableWakeLock();
+        autoMode = true;
+        lastOcrNonEmpty = false;
+        log("STATUS: 자동 문제풀이 모드를 시작할게.");
+        scheduleAutoStep(0);
+      } catch (e) {
+        log(`STATUS: 자동 모드 시작 실패: ${e?.message || e}`);
+      }
+    });
+
+    btnAutoStop.addEventListener("click", async () => {
+      if (!autoMode) return;
+      autoMode = false;
+      if (autoTimer) {
+        clearTimeout(autoTimer);
+        autoTimer = null;
+      }
+      await disableWakeLock();
+      log("STATUS: 자동 문제풀이 모드를 종료할게.");
+    });
+
+    btnTtsTest.addEventListener("click", () => {
+      speakTest();
+    });
+
+    // 페이지 나갈 때 wake lock 해제
+    window.addEventListener("beforeunload", () => {
+      autoMode = false;
+      if (autoTimer) clearTimeout(autoTimer);
+      disableWakeLock();
+    });
+  </script>
+</body>
+</html>
 
