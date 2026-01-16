@@ -1,13 +1,19 @@
 // netlify/functions/solve.js
-// ----------------------------------------
-// 역할: 외대 편입 영어(T2) 객관식 "정답만" 생성
-// 입력: { ocrText?: string, text?: string, page?: number }
-// 출력: { ok: true, text: "1: C\n2: B\n...", debug: {...} } 또는 { ok: false, error: "..." }
+// ------------------------------------------------------------
+// HUFS(한국외대) 편입영어 T2 전용 "정답만(1~4)" 생성기 (연도 무관)
+// - 모델: openai/gpt-4.1 고정
+// - temperature: 0.1 고정
+// - 입력: { ocrText: string, page?: number }
+// - 출력: { ok: true, text: "1: 3\n2: 1\n...\nUNSURE: 18,23", debug: {...} }
 //
-// 환경변수:
-// - OPENROUTER_API_KEY (필수)
-// - MODEL_NAME        (선택, 기본: "openai/gpt-4.1")
-// - TEMPERATURE       (선택, 기본: 0.1)
+// 핵심 설계
+// 1) OCR 텍스트 정규화: 선지 A/B/C/D 변형 -> 1)/2)/3)/4) 보조 표기, 괄호류 통일, <A> 마커 통일
+// 2) 문항 블록 추출: "줄 시작의 (숫자. / 숫자) )"만 문항 시작으로 인정 + 헤더/배점/범위표 오탐 필터
+// 3) 모델 3회 호출(서로 다른 시스템 지침) + 다수결로 안정화
+// 4) 문항 누락 0: 답이 빠지면 1로 채우고 UNSURE에 추가
+//
+// 옵션(선택):
+// - STOP_TOKEN 환경변수 있으면 모델에게 끝에 붙이게 유도하고 그 이후는 잘라 파싱 안정화 (기본 XURTH)
 
 function json(statusCode, obj) {
   return {
@@ -15,294 +21,323 @@ function json(statusCode, obj) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
     },
     body: JSON.stringify(obj),
   };
 }
 
-// ---------- 유틸 ----------
-
-function safeNumber(x, fallback) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : fallback;
+function toStr(x) {
+  return x == null ? "" : String(x);
 }
 
-// OCR 텍스트에서 "문제 번호 후보" 추출
-// 예: "1. ..." "2)" "10." 등 → 1~50 범위 숫자만 뽑음
-function extractVisibleQuestionNumbers(ocrText) {
-  const text = String(ocrText || "");
-  const nums = new Set();
+function normalizeOcrText(raw) {
+  let t = toStr(raw);
 
-  // 패턴 1: "12." 또는 "12)"
-  const re1 = /(\d{1,2})\s*[\.\)]/g;
+  // 줄바꿈/공백 표준화
+  t = t.replace(/\r\n?/g, "\n");
+  t = t.replace(/\u00A0/g, " ");
+  t = t.replace(/[ \t]+/g, " ");
+
+  // 다양한 대시/구분선 표기 통일: ---- 로
+  // (—, –, _, = 등이 OCR에서 섞일 수 있음)
+  t = t.replace(/^[\s\-—–_=]{3,}$/gm, "----");
+
+  // 따옴표 표준화
+  t = t.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+
+  // 원형 숫자 보기(①②③④) → 1 2 3 4 (혹시 남아있을 때 대비)
+  const circledMap = { "①": "1", "②": "2", "③": "3", "④": "4" };
+  t = t.replace(/[①②③④]/g, (m) => circledMap[m] || m);
+
+  // 괄호/대괄호/특수꺾쇠가 섞여도 "마커"는 <>로 통일하기 위해 1차 정리
+  // (사용자가 수기로 <>를 쓰더라도 OCR이 ()나 []로 깨질 수 있음)
+  //  - 단, 여기서 모든 괄호를 <>로 바꾸면 문장 괄호까지 망가질 수 있으니
+  //    "A/B/C/D 한 글자 마커"에만 적용한다.
+  // 예: (A)those / [B]their / <C>their / {D}their → <A>those ...
+  t = t.replace(/[\(\[\{<]\s*([ABCD])\s*[\)\]\}>]/g, "<$1>");
+
+  // 사용자가 밑줄을 <>로 표기했는데 OCR이 << >> 혹은 ‹ › 로 깨지는 경우 보정
+  t = t.replace(/[‹«]/g, "<").replace(/[›»]/g, ">");
+
+  // 선지 라벨 정규화:
+  // 줄 시작 또는 줄바꿈 뒤에 오는 A) / A. / A> / A: / A - 등을 "1) "로 보조 표기
+  // (원문 A/B/C/D 유지보다, 모델이 보기 순서를 숫자로 안정적으로 잡게 하는 게 목적)
+  const opt = [
+    { re: /(^|\n)\s*A\s*[\)\.\>\:\-]\s+/g, rep: "$11) " },
+    { re: /(^|\n)\s*B\s*[\)\.\>\:\-]\s+/g, rep: "$12) " },
+    { re: /(^|\n)\s*C\s*[\)\.\>\:\-]\s+/g, rep: "$13) " },
+    { re: /(^|\n)\s*D\s*[\)\.\>\:\-]\s+/g, rep: "$14) " },
+  ];
+  for (const { re, rep } of opt) t = t.replace(re, rep);
+
+  // (드물게) "A "만 있고 구두점이 날아간 경우: 줄 시작 "A " + 단어로 시작하면 보기로 추정
+  // 너무 공격적이면 지문 첫 글자 A를 망가뜨릴 수 있으므로, 다음 토큰이 소문자/숫자면 제외하고 짧게만 허용
+  t = t.replace(/(^|\n)\s*A\s+(?=[A-Z][a-z]{1,15}\b)/g, "$11) ");
+  t = t.replace(/(^|\n)\s*B\s+(?=[A-Z][a-z]{1,15}\b)/g, "$12) ");
+  t = t.replace(/(^|\n)\s*C\s+(?=[A-Z][a-z]{1,15}\b)/g, "$13) ");
+  t = t.replace(/(^|\n)\s*D\s+(?=[A-Z][a-z]{1,15}\b)/g, "$14) ");
+
+  // 제어문자 제거
+  t = t.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
+
+  // 과도한 빈줄 정리
+  t = t.replace(/\n{3,}/g, "\n\n");
+
+  return t.trim();
+}
+
+function looksLikeHeaderOrScore(block) {
+  const s = block.trim();
+  if (!s) return true;
+
+  // 너무 짧고 점수/범위/헤더 냄새
+  const short = s.length < 120;
+  const headerish =
+    /202\d학년도|한국외대|편입학|필답고사|문제지|T2|A형|배점|point each|총\s*100|합계|[［\[]\s*\d+\s*-\s*\d+\s*[］\]]/i.test(s);
+
+  // 선지/BLANK/Choose/Read 등이 없으면 헤더로 처리
+  const hasChoice = /\b[1-4]\)\s+\S/.test(s) || /\bBLANK\b/i.test(s);
+  const hasQuestionCue = /\bChoose\b|\bclosest\b|\bmeaning\b|\bINCORRECT\b|\bRead the following\b|\bpassage\b/i.test(s);
+  if (short && headerish && !hasChoice && !hasQuestionCue) return true;
+
+  return false;
+}
+
+function looksLikeQuestionBlock(block) {
+  const s = block;
+
+  // 보기(1)~(4) 혹은 BLANK 혹은 전형적 지시문/독해 표기
+  const hasChoices = /\b1\)\s+\S/.test(s) && /\b2\)\s+\S/.test(s) && /\b3\)\s+\S/.test(s) && /\b4\)\s+\S/.test(s);
+  const hasBlank = /\bBLANK\b/i.test(s);
+  const hasCue = /\bChoose\b|\bclosest\b|\bmeaning\b|\bINCORRECT\b|\bRead the following\b|\bpassage\b|\bquestions\b/i.test(s);
+  const hasMarker = /<\s*[ABCD]\s*>/.test(s); // 지문 표식
+
+  return hasChoices || hasBlank || hasCue || hasMarker;
+}
+
+function extractQuestionBlocks(text) {
+  // 문항 시작: 줄 시작 "숫자." 또는 "숫자)"
+  // (중요) 반드시 줄 시작만 인정 → [14-17], 7-1 같은 것 배제
+  const src = "\n" + text + "\n";
+  const re = /(^|\n)\s*(\d{1,2})\s*[\.\)]\s+/g;
+
+  const starts = [];
   let m;
-  while ((m = re1.exec(text)) !== null) {
-    const n = parseInt(m[1], 10);
-    if (!Number.isNaN(n) && n >= 1 && n <= 50) {
-      nums.add(n);
-    }
+  while ((m = re.exec(src)) !== null) {
+    const num = Number(m[2]);
+    if (!Number.isFinite(num) || num < 1 || num > 60) continue;
+    const idx = m.index + (m[1] ? m[1].length : 0);
+    starts.push({ num, idx });
   }
 
-  // 패턴 2(보조): 줄 시작에 있는 번호 "12 " (마침표 누락 케이스)
-  const re2 = /(^|\n)\s*(\d{1,2})\s+(?=[A-Za-z(])/g;
-  while ((m = re2.exec(text)) !== null) {
-    const n = parseInt(m[2], 10);
-    if (!Number.isNaN(n) && n >= 1 && n <= 50) {
-      nums.add(n);
-    }
-  }
-
-  const arr = Array.from(nums).sort((a, b) => a - b);
-  return arr;
-}
-
-// 가장 긴 연속 구간만 "진짜 문제 번호"로 사용
-// 예: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,37] → 1~14만 사용
-function getMainQuestionBlock(visible) {
-  if (!Array.isArray(visible) || visible.length === 0) return [];
-
-  const nums = Array.from(new Set(visible)).sort((a, b) => a - b);
+  if (starts.length === 0) return [];
 
   const blocks = [];
-  let start = nums[0];
-  let prev = nums[0];
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i].idx;
+    const end = i + 1 < starts.length ? starts[i + 1].idx : src.length;
+    const block = src.slice(start, end).trim();
 
-  for (let i = 1; i < nums.length; i++) {
-    const n = nums[i];
-    if (n === prev + 1) {
-      prev = n;
-      continue;
-    }
-    // 블록 종료
-    blocks.push({ start, end: prev, length: prev - start + 1 });
-    start = n;
-    prev = n;
+    if (looksLikeHeaderOrScore(block)) continue;
+    if (!looksLikeQuestionBlock(block)) continue;
+
+    blocks.push({ num: starts[i].num, block });
   }
-  blocks.push({ start, end: prev, length: prev - start + 1 });
 
-  // 가장 긴 연속 구간 선택
-  let main = null;
+  // 같은 번호 중복이면 더 긴 블록을 채택
+  const byNum = new Map();
   for (const b of blocks) {
-    if (!main || b.length > main.length) {
-      main = b;
-    }
+    const prev = byNum.get(b.num);
+    if (!prev || b.block.length > prev.block.length) byNum.set(b.num, b);
   }
 
-  // 길이가 2 미만이면(번호 1개만 잡힌 경우) 신뢰도 낮으므로 빈 배열 반환
-  if (!main || main.length < 2) return [];
-
-  const result = [];
-  for (let q = main.start; q <= main.end; q++) {
-    result.push(q);
-  }
-  return result;
+  return Array.from(byNum.values()).sort((a, b) => a.num - b.num);
 }
 
-// 모델에게 줄 프롬프트 구성
-function buildPrompt(ocrText, questionNumbers) {
-  const qsList = questionNumbers.join(", ");
+function buildPrompt(questionBlocks, stopToken) {
+  const items = questionBlocks
+    .map((q) => `Q${q.num}:\n${q.block}\n`)
+    .join("\n");
 
-  const instructions = `
-You are an expert exam solver for HUFS (Hankuk University of Foreign Studies) transfer English test (T2).
-You will receive OCR text for one or more multiple-choice questions.
+  const stopLine = stopToken ? `\nEnd every output with the token: ${stopToken}\n` : "";
 
-Your job:
-1. Solve ONLY the questions whose numbers are in this list: [${qsList}].
-2. Each question has exactly FOUR choices. The correct answer must be one of: A, B, C, D.
-3. For each question number, output exactly one line in this format:
-   "<number>: <choice>"
-   Example: "1: C"
-4. After all question lines, output ONE final line:
-   "UNSURE: <comma-separated question numbers>"
-   If you are reasonably confident (≥80%) about all answers, write:
-   "UNSURE: (none)"
-
-Very important constraints:
-- Do NOT answer for any question numbers that are not in [${qsList}].
-- Never invent new question numbers.
-- Never output explanations, reasoning, summaries, or any extra text.
-- Only output the lines of answers and the final UNSURE line.
-
-Answering strategy (must follow):
-- Read the OCR text carefully; fix obvious OCR typos mentally (e.g., "hackneved" → "hackneyed", "company" → "companion").
-- For vocabulary/synonym questions:
-  * Focus on the contextual meaning, not just dictionary definitions.
-  * Eliminate options that conflict with tone (positive/negative) or part of speech.
-- For grammar questions:
-  * Check subject–verb agreement, relative pronouns, word order, and idiomatic usage.
-- For paraphrase / closest-in-meaning questions:
-  * Pay very careful attention to:
-    - Polarity (negation): not, never, hardly, scarcely, no longer, etc.
-    - Modality: can, must, may, should, have to, etc.
-    - Temporal expressions: now, still, already, yet, so far, any more, any longer.
-    - Degree/quantity: too, enough, hardly any, no longer afford, so much, only, just.
-  * Do NOT choose an option that flips or weakens these aspects.
-  * Example: "can no longer afford to be indifferent" implies:
-      (1) Until now, the system HAS BEEN indifferent (too indifferent so far),
-      (2) From now on, it cannot remain indifferent.
-    The correct paraphrase must preserve BOTH "past excessive indifference" AND "change required now".
-- For reading comprehension questions:
-  * Prefer the option that matches BOTH local sentence meaning and passage's main idea.
-  * Reject options that add strong claims not in the text or that contradict the passage.
-
-Confidence handling:
-- If you are forced to guess with very low confidence, still choose the single most likely option (A/B/C/D),
-  but include that question number in the UNSURE list.
-- If you are clearly confident (≥80%) for a question, do NOT include it in UNSURE.
-
-Now, here is the OCR text for the page:
-
----------------- OCR TEXT START ----------------
-${ocrText}
----------------- OCR TEXT END ----------------
-
-Remember:
-- Only answer for question numbers in [${qsList}].
-- Output lines like "14: C" and then exactly one line "UNSURE: ...".
-`;
-
-  return instructions.trim();
+  return (
+    "You are solving HUFS (Hankuk University of Foreign Studies) transfer English exam T2.\n" +
+    "Output ONLY answers.\n\n" +
+    "Strict rules:\n" +
+    "- Solve ONLY the questions listed below (Q numbers provided). Never invent new question numbers.\n" +
+    "- Each question has exactly FOUR choices in order. Output MUST be a number 1,2,3,4 (NOT A/B/C/D).\n" +
+    "- Output one line per question: `n: 1` (example: `14: 4`).\n" +
+    "- After all answers, output exactly one final line: `UNSURE: ...` (comma-separated numbers) or `UNSURE: (none)`.\n" +
+    "- No explanations, no extra text.\n\n" +
+    "How to interpret OCR conventions:\n" +
+    "- Choices may appear as 1) 2) 3) 4). (They can originate from A)/B)/C)/D) OCR normalization.\n" +
+    "- `<...>` marks an underlined word/phrase in the original.\n" +
+    "- `<A> <B> <C> <D>` inside a passage are NOT choices; they are in-text markers (referents/underlines).\n" +
+    "- `BLANK` indicates a blank to be filled.\n" +
+    "- Fix obvious OCR typos mentally.\n\n" +
+    "Accuracy priorities (HUFS T2):\n" +
+    "- Reading comprehension is heavily weighted. Do NOT rush: track main idea, details, inference, and referents carefully.\n" +
+    "- For grammar-incorrect questions: choose the segment (1..4) that is grammatically wrong.\n" +
+    "- For referent questions with <A><B><C><D>: determine antecedent for each marker; pick the one that differs.\n\n" +
+    "Questions:\n" +
+    items +
+    stopLine
+  ).trim();
 }
 
-// 모델 응답에서 "N: X" 형식 파싱
-function parseModelAnswer(rawText, expectedQuestionNumbers) {
-  const text = String(rawText || "");
-  const lines = text.split(/\r?\n/);
+function cutByStopToken(s, stopToken) {
+  if (!stopToken) return s;
+  const idx = s.indexOf(stopToken);
+  if (idx === -1) return s;
+  return s.slice(0, idx);
+}
 
-  const answers = {};
-  const expectedSet = new Set(expectedQuestionNumbers);
+function parseModelAnswers(modelText, stopToken) {
+  const out = new Map();
+  const unsure = new Set();
 
-  // 1) 정답 라인 파싱
-  const lineRe = /^(\d{1,2})\s*:\s*([A-D1-4])\b/i;
+  let text = toStr(modelText);
+  text = cutByStopToken(text, stopToken);
+  text = text.replace(/\r\n?/g, "\n");
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
+  const lines = text
+    .split("\n")
+    .map((x) => x.trim())
+    .filter(Boolean);
 
-    const m = line.match(lineRe);
-    if (!m) continue;
-
-    const qNum = parseInt(m[1], 10);
-    let ch = m[2].toUpperCase();
-
-    if (!expectedSet.has(qNum)) {
-      // 기대하지 않는 번호는 무시
+  for (const line of lines) {
+    const um = line.match(/^UNSURE\s*:\s*(.*)$/i);
+    if (um) {
+      const tail = um[1] || "";
+      if (/^\(none\)$/i.test(tail) || /^none$/i.test(tail)) continue;
+      const nums = tail.match(/\d{1,2}/g);
+      if (nums) nums.forEach((n) => unsure.add(Number(n)));
       continue;
     }
 
-    // 만약 모델이 1~4 숫자로 답하면 A~D로 변환
-    if (/[1-4]/.test(ch)) {
-      const mapNumToLetter = { "1": "A", "2": "B", "3": "C", "4": "D" };
-      ch = mapNumToLetter[ch] || ch;
-    }
-
-    if (!/[A-D]/.test(ch)) continue;
-
-    answers[qNum] = ch;
-  }
-
-  // 2) UNSURE 라인 파싱
-  let unsure = [];
-  const unsureRe = /^UNSURE\s*:\s*(.*)$/i;
-  for (const rawLine of lines) {
-    const m = rawLine.trim().match(unsureRe);
+    // "18: 4" / "18-4" / "18 : D" 등 허용
+    const m = line.match(/^(\d{1,2})\s*[:\-]\s*([1-4ABCD])\b/i);
     if (!m) continue;
-    const payload = m[1].trim();
-    if (!payload || /^(\(none\)|none)$/i.test(payload)) {
-      unsure = [];
-      break;
-    }
-    const parts = payload.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
-    unsure = parts
-      .map((x) => parseInt(x, 10))
-      .filter((n) => Number.isFinite(n) && expectedSet.has(n));
-    break;
+
+    const q = Number(m[1]);
+    let a = String(m[2]).toUpperCase();
+
+    // A-D -> 1-4 변환
+    if (a === "A") a = "1";
+    else if (a === "B") a = "2";
+    else if (a === "C") a = "3";
+    else if (a === "D") a = "4";
+
+    if (!/^[1-4]$/.test(a)) continue;
+    out.set(q, a);
   }
 
-  return { answers, unsure };
+  return { answers: out, unsure };
 }
 
-// ---------- OpenRouter 호출 ----------
+function majorityVote(questionNumbers, parsedList) {
+  const finalAnswers = new Map();
+  const finalUnsure = new Set();
 
-async function callOpenRouter({ apiKey, model, temperature, prompt }) {
-  const url = "https://openrouter.ai/api/v1/chat/completions";
+  for (const q of questionNumbers) {
+    const counts = { "1": 0, "2": 0, "3": 0, "4": 0 };
+    let seen = false;
 
-  const body = {
-    model,
-    temperature,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a highly accurate multiple-choice exam solver. Return only the requested answer lines. No explanations.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  };
+    for (const p of parsedList) {
+      if (p.unsure && p.unsure.has(q)) finalUnsure.add(q);
+      const v = p.answers.get(q);
+      if (v) {
+        counts[v] += 1;
+        seen = true;
+      }
+    }
+    if (!seen) continue;
 
-  const res = await fetch(url, {
+    let best = "1";
+    let bestCount = -1;
+    for (const k of ["1", "2", "3", "4"]) {
+      if (counts[k] > bestCount) {
+        best = k;
+        bestCount = counts[k];
+      }
+    }
+
+    const tied = ["1", "2", "3", "4"].filter((k) => counts[k] === bestCount);
+    // 동률이면 2번째 호출(문법/참조 강화)을 타이브레이커로 사용
+    if (tied.length > 1 && parsedList[1]) {
+      const t = parsedList[1].answers.get(q);
+      if (t && tied.includes(t)) best = t;
+    }
+
+    finalAnswers.set(q, best);
+  }
+
+  return { finalAnswers, finalUnsure };
+}
+
+async function callOpenRouter({ apiKey, model, temperature, messages }) {
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      "HTTP-Referer": "https://example.com",
+      "X-Title": "HUFS-T2-Solver",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model,
+      temperature,
+      messages,
+    }),
   });
 
-  const data = await res.json().catch(() => null);
-
-  if (!res.ok || !data) {
-    return {
-      ok: false,
-      error: "OpenRouter HTTP error",
-      status: res.status,
-      data,
-    };
+  const raw = await res.text().catch(() => "");
+  if (!res.ok) {
+    throw new Error(`OpenRouter HTTP ${res.status}: ${raw.slice(0, 400)}`);
   }
 
-  const choice = data.choices && data.choices[0];
-  const content =
-    choice && choice.message && typeof choice.message.content === "string"
-      ? choice.message.content
-      : "";
-
-  if (!content) {
-    return {
-      ok: false,
-      error: "Empty response from model",
-      status: res.status,
-      data,
-    };
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error("OpenRouter response JSON parse failed");
   }
 
-  return {
-    ok: true,
-    text: content,
-    raw: data,
-  };
+  const content = data?.choices?.[0]?.message?.content;
+  return toStr(content);
 }
 
-// ---------- Netlify handler ----------
+async function callWithRetry(payload, retries = 2) {
+  let lastErr = null;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await callOpenRouter(payload);
+    } catch (e) {
+      lastErr = e;
+      // 짧은 지연(Netlify 제한 고려해서 아주 짧게)
+      await new Promise((r) => setTimeout(r, 150 + i * 150));
+    }
+  }
+  throw lastErr || new Error("Unknown OpenRouter error");
+}
 
 exports.handler = async (event) => {
   try {
-    if (event.httpMethod !== "POST") {
-      return json(405, { ok: false, error: "POST only" });
-    }
+    if (event.httpMethod === "OPTIONS") return json(200, { ok: true });
+    if (event.httpMethod !== "POST") return json(405, { ok: false, error: "POST only" });
 
     const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-      return json(500, {
-        ok: false,
-        error: "OPENROUTER_API_KEY is not set",
-      });
-    }
+    if (!apiKey) return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
 
-    const model = process.env.MODEL_NAME || "openai/gpt-4.1";
-    const temperature = safeNumber(process.env.TEMPERATURE, 0.1);
+    // 요청사항 고정
+    const model = "openai/gpt-4.1";
+    const temperature = 0.1;
+
+    const stopToken = (process.env.STOP_TOKEN || "XURTH").trim(); // optional-but-helpful
+    const useStop = stopToken.length > 0;
 
     let body = {};
     try {
@@ -312,115 +347,89 @@ exports.handler = async (event) => {
     }
 
     const page = body.page ?? 1;
-    const ocrTextRaw = body.ocrText || body.text || "";
-    const ocrText = String(ocrTextRaw || "").trim();
+    const rawOcrText = toStr(body.ocrText || body.text || "");
+    if (!rawOcrText.trim()) return json(400, { ok: false, error: "ocrText is empty" });
 
-    if (!ocrText) {
-      return json(400, {
-        ok: false,
-        error: "Missing ocrText/text in body",
-      });
-    }
+    const ocrText = normalizeOcrText(rawOcrText);
 
-    // 1) OCR 텍스트에서 보이는 번호 후보 추출
-    const visibleQuestionNumbers = extractVisibleQuestionNumbers(ocrText);
+    // 문항 블록 추출
+    const questionBlocks = extractQuestionBlocks(ocrText);
+    const questionNumbers = questionBlocks.map((q) => q.num);
 
-    // 2) 가장 긴 연속 구간만 실제 문제 번호로 사용
-    let questionNumbers = getMainQuestionBlock(visibleQuestionNumbers);
-
-    // 백업: 만약 연속 블록이 안 잡혔는데 숫자는 있으면, 있는 숫자 그대로라도 사용
-    if (!questionNumbers.length && visibleQuestionNumbers.length) {
-      questionNumbers = visibleQuestionNumbers.slice();
-    }
-
-    if (!questionNumbers.length) {
-      // 번호를 전혀 못 잡았으면, 억지로 추측하지 말고 에러 반환
+    if (!questionBlocks.length) {
       return json(200, {
-        ok: false,
-        error: "Could not detect question numbers from OCR text",
-        page,
-        visibleQuestionNumbers,
+        ok: true,
+        text: "UNSURE: (all)",
+        debug: { model, temperature, page, questionNumbers: [], reason: "No question blocks detected" },
       });
     }
 
-    // 3) 프롬프트 생성
-    const prompt = buildPrompt(ocrText, questionNumbers);
+    // 3개 프롬프트(역할 분리)로 안정화
+    const basePrompt = buildPrompt(questionBlocks, useStop ? stopToken : "");
+    const qList = questionNumbers.join(", ");
 
-    // 4) OpenRouter 호출
-    const modelRes = await callOpenRouter({
-      apiKey,
-      model,
-      temperature,
-      prompt,
-    });
+    const messages1 = [
+      { role: "system", content: "Solve accurately. Output strictly in the requested format. No extra text." },
+      { role: "user", content: basePrompt + `\n\nVisible Q list: ${qList}\n` },
+    ];
 
-    if (!modelRes.ok) {
-      return json(200, {
-        ok: false,
-        error: modelRes.error || "Model call failed",
-        page,
-        model,
-        temperature,
-        visibleQuestionNumbers,
-        questionNumbers,
-        raw: modelRes.data || null,
-      });
-    }
+    const messages2 = [
+      {
+        role: "system",
+        content:
+          "Be extremely strict about grammar, referents, and logical consistency. Reading questions are critical. Output strictly.",
+      },
+      { role: "user", content: basePrompt + `\n\nVisible Q list: ${qList}\n` },
+    ];
 
-    // 5) 모델 출력 파싱
-    const parsed = parseModelAnswer(modelRes.text, questionNumbers);
-    const answers = parsed.answers;
-    let unsure = parsed.unsure || [];
+    const messages3 = [
+      {
+        role: "system",
+        content:
+          "Focus on OCR robustness: fix typos mentally, keep option order stable, avoid being misled by noise. Output strictly.",
+      },
+      { role: "user", content: basePrompt + `\n\nVisible Q list: ${qList}\n` },
+    ];
 
-    // 누락된 문항이 있다면: 일단 채워 넣고 UNSURE에 추가
-    const missing = [];
+    // 병렬 호출
+    const [r1, r2, r3] = await Promise.all([
+      callWithRetry({ apiKey, model, temperature, messages: messages1 }),
+      callWithRetry({ apiKey, model, temperature, messages: messages2 }),
+      callWithRetry({ apiKey, model, temperature, messages: messages3 }),
+    ]);
+
+    const p1 = parseModelAnswers(r1, useStop ? stopToken : "");
+    const p2 = parseModelAnswers(r2, useStop ? stopToken : "");
+    const p3 = parseModelAnswers(r3, useStop ? stopToken : "");
+
+    const { finalAnswers, finalUnsure } = majorityVote(questionNumbers, [p1, p2, p3]);
+
+    // 누락 0 보장
     for (const q of questionNumbers) {
-      if (!answers[q]) {
-        missing.push(q);
+      if (!finalAnswers.has(q)) {
+        finalAnswers.set(q, "1");
+        finalUnsure.add(q);
       }
     }
-    if (missing.length > 0) {
-      const fallbackChoices = ["A", "B", "C", "D"];
-      for (const q of missing) {
-        // 간단한 fallback: 항상 B로 채워도 되지만, 조금 섞어서 채움
-        const idx = q % fallbackChoices.length;
-        answers[q] = fallbackChoices[idx];
-      }
-      // UNSURE 목록에 누락 문항 추가
-      const unsureSet = new Set(unsure);
-      for (const q of missing) unsureSet.add(q);
-      unsure = Array.from(unsureSet).sort((a, b) => a - b);
-    }
 
-    // 6) 최종 텍스트 구성
-    const lines = [];
-    for (const q of questionNumbers) {
-      lines.push(`${q}: ${answers[q]}`);
-    }
-    if (unsure.length > 0) {
-      lines.push(`UNSURE: ${unsure.join(", ")}`);
-    } else {
-      lines.push("UNSURE: (none)");
-    }
+    const lines = questionNumbers.map((q) => `${q}: ${finalAnswers.get(q)}`);
 
-    const finalText = lines.join("\n");
+    const unsureList = Array.from(finalUnsure).sort((a, b) => a - b);
+    lines.push(`UNSURE: ${unsureList.length ? unsureList.join(",") : "(none)"}`);
 
     return json(200, {
       ok: true,
-      text: finalText,
+      text: lines.join("\n"),
       debug: {
         model,
         temperature,
         page,
-        visibleQuestionNumbers,
+        extractedCount: questionBlocks.length,
         questionNumbers,
+        usedStopToken: useStop ? stopToken : "(disabled)",
       },
     });
-  } catch (e) {
-    return json(200, {
-      ok: false,
-      error: "Unhandled error in solve function",
-      detail: String(e && e.message ? e.message : e),
-    });
+  } catch (err) {
+    return json(500, { ok: false, error: err?.message || String(err) });
   }
 };
