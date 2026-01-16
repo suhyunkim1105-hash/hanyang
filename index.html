@@ -98,6 +98,14 @@
       </div>
     </div>
 
+    <!-- 정답 카드: 카메라 바로 아래로 이동 -->
+    <div class="card">
+      <h2>정답</h2>
+      <div class="small">정답은 "1: A" 같은 형식 + 마지막 줄에 UNSURE: ... 로 나옴. 음성으로도 읽어줌.</div>
+      <div style="height:10px"></div>
+      <textarea id="ansBox" placeholder="정답 결과가 여기에 표시됨" readonly></textarea>
+    </div>
+
     <div class="card">
       <h2>로그</h2>
       <pre id="log"></pre>
@@ -108,13 +116,6 @@
       <div class="small">여기서 OCR이 얼마나 제대로 뽑혔는지 즉시 확인해. (정답률의 핵심)</div>
       <div style="height:10px"></div>
       <textarea id="ocrBox" placeholder="OCR 결과가 여기에 표시됨" readonly></textarea>
-    </div>
-
-    <div class="card">
-      <h2>정답</h2>
-      <div class="small">정답은 "1: A" 같은 형식 + 마지막 줄에 UNSURE: ... 로 나옴. 음성으로도 읽어줌.</div>
-      <div style="height:10px"></div>
-      <textarea id="ansBox" placeholder="정답 결과가 여기에 표시됨" readonly></textarea>
     </div>
   </div>
 
