@@ -1,172 +1,154 @@
-// netlify/functions/solve.js
-// HUFS (한국외대) 편입 영어 T2 전용 자동 정답 생성기
-// 입력: { ocrText: string, page?: number }
-// 출력: { ok: true, text: "1: A\n2: B...", debug: {...} }
+// netlify/functions/ocr.js
+// OCR.Space PRO 호출 (apipro1/apipro2). JSON(dataURL base64) 받아서 base64Image로 전달.
+// - env: OCR_SPACE_API_KEY (필수)
+// - env: OCR_SPACE_API_ENDPOINT (권장: https://apipro1.ocr.space/parse/image)
+// - env: OCR_SPACE_API_ENDPOINT_BACKUP (권장: https://apipro2.ocr.space/parse/image)
+// - env: OCR_SPACE_TIMEOUT_MS (옵션, 기본 30000)
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function json(statusCode, obj) {
   return {
     statusCode,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
+    headers: { "Content-Type": "application/json; charset=utf-8" },
     body: JSON.stringify(obj),
   };
 }
 
-// 질문 번호 추출: OCR 텍스트에서 보이는 번호와, 그 최소~최대 구간을 모두 채운 번호를 같이 만든다.
-function extractQuestionNumbers(rawText) {
-  const visible = new Set();
-  if (!rawText) return { visibleQuestionNumbers: [], questionNumbers: [] };
+// OCR.Space 응답에서 텍스트/메타 정보 뽑기
+function extractOcrResult(parsedJson) {
+  try {
+    if (!parsedJson) return { ok: false, reason: "No JSON" };
 
-  const text = String(rawText);
-  // 1~50 사이에서 "숫자. " 또는 "숫자)" 패턴을 전부 찾는다.
-  const regex = /(\d{1,2})\s*[\.\)]/g;
-  let m;
-  while ((m = regex.exec(text)) !== null) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 50) {
-      visible.add(n);
+    const exitCode = parsedJson.OCRExitCode;
+    const isErrored = !!parsedJson.IsErroredOnProcessing;
+
+    if (exitCode !== 1 || isErrored) {
+      // OCR.Space가 에러라고 판단한 경우
+      const msg =
+        (parsedJson.ErrorMessage && parsedJson.ErrorMessage.join
+          ? parsedJson.ErrorMessage.join("; ")
+          : parsedJson.ErrorMessage) ||
+        parsedJson.ErrorMessage ||
+        parsedJson.ErrorDetails ||
+        "OCR.Space reported an error";
+      return {
+        ok: false,
+        reason: msg,
+        exitCode,
+        isErroredOnProcessing: isErrored,
+      };
     }
+
+    const results = parsedJson.ParsedResults || [];
+    const texts = results
+      .map((r) => (r.ParsedText != null ? String(r.ParsedText) : ""))
+      .filter((t) => t.length > 0);
+
+    const text = texts.join("\n").trim();
+
+    // 신뢰도 평균 (없으면 0)
+    let meanConfidence = 0;
+    let count = 0;
+    for (const r of results) {
+      if (typeof r.ParsedText !== "string") continue;
+      if (typeof r.Confidence === "number") {
+        meanConfidence += r.Confidence;
+        count++;
+      }
+    }
+    if (count > 0) meanConfidence = meanConfidence / count;
+
+    // 번호 패턴 개수 ( 1. / 2. / 11. 이런 것 세기 )
+    let questionNumberCount = 0;
+    try {
+      const pattern = /(^|\n)\s*\d{1,2}\s*[\.\)]/g;
+      const matches = text.match(pattern);
+      if (matches) questionNumberCount = matches.length;
+    } catch {
+      questionNumberCount = 0;
+    }
+
+    return {
+      ok: true,
+      text,
+      meta: {
+        meanConfidence,
+        questionNumberCount,
+        ocrExitCode: exitCode,
+        isErroredOnProcessing: isErrored,
+      },
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      reason: "Failed to parse OCR result: " + String(e && e.message ? e.message : e),
+    };
   }
-
-  const visibleArr = Array.from(visible).sort((a, b) => a - b);
-  if (visibleArr.length === 0) {
-    return { visibleQuestionNumbers: [], questionNumbers: [] };
-  }
-
-  const minN = visibleArr[0];
-  const maxN = visibleArr[visibleArr.length - 1];
-  const all = [];
-  for (let n = minN; n <= maxN; n++) all.push(n);
-
-  return { visibleQuestionNumbers: visibleArr, questionNumbers: all };
 }
 
-const ROLE_CONFIGS = [
-  { name: "base",    styleHint: "balanced; overall best answer" },
-  { name: "lexical", styleHint: "focus on vocabulary nuance, collocations, and idioms" },
-  { name: "logic",   styleHint: "focus on logical structure, argument flow, and inference" },
-  { name: "reading", styleHint: "focus on passage comprehension, topic, purpose, and tone" },
-  { name: "grammar", styleHint: "focus on grammar, syntax, and sentence structure" },
-];
+async function callOcrSpaceOnce(endpoint, apiKey, base64Image, timeoutMs) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
 
-async function callOpenRouter(apiKey, model, temperature, stopToken, roleConfig, ocrText, page, questionNumbers) {
-  const systemPrompt = `You are an expert solver for the HUFS (Hankuk University of Foreign Studies) transfer English exam, type T2.
+  try {
+    const params = new URLSearchParams();
+    // OCR.Space는 base64Image에 dataURL 전체("data:image/..;base64,...")를 기대함
+    params.append("apikey", apiKey);
+    params.append("base64Image", base64Image);
 
-GOAL:
-- For the question numbers given, choose the most likely correct option among A, B, C, D for EACH question.
-- Output ONLY lines of the form "N: X" where N is the question number (integer) and X is one of A, B, C, D.
-- After the last line, output the stop token ${stopToken} on its own line.
-- Absolutely no explanations, no Korean, no commentary, no extra text.
+    // ✅ 영어 문제지 전용: 영어만 인식하도록 eng 사용
+    params.append("language", "eng");
 
-IMPORTANT CONSTRAINTS:
-- This exam always has 4 options (A–D). Never output anything else.
-- Answer ALL question numbers you are given. If some question text is cut or incomplete, still guess the single best answer based on context or general knowledge. Never skip.
-- Use the full OCR text (including instructions, examples, headings) to reconstruct missing parts as much as possible.
-- Be very careful about pages where a passage continues across questions (e.g., 24–27 share one passage). Read the whole surrounding text before answering any of them.
+    params.append("OCREngine", "2");
+    params.append("scale", "true");
+    params.append("isTable", "false");
 
-PROBLEM TYPES AND STRATEGIES:
-- Completion / Vocab-in-context (1–4형):
-  * Check subject, verb, and object; required meaning; and collocations.
-  * Eliminate options that are wrong in nuance, register, or collocation even if grammatically possible.
-- Synonym / Meaning (underlined word 교체):
-  * Focus on the CONTEXTUAL meaning of the underlined word, not the dictionary headword.
-  * Replace the underlined word with each option; choose the one that preserves the author's tone and logic.
-- Grammar / Sentence structure (도치, 관계사, 분사구문, 비교, 가정법 등):
-  * Check word order, agreement, tense, parallelism, and required connectors.
-  * For "choose INCORRECT" types, find the single option that breaks grammar or meaning.
-- Reading / Passage questions (24번 이후 지문):
-  * First, understand the main idea, purpose, and structure of the passage.
-  * For 제목/주제: pick the answer that is (a) not too narrow, (b) not too broad, (c) matches all paragraphs.
-  * For 삽입/문장 위치: ensure pronoun reference, logical connectors, and time sequence fit.
-  * For 빈칸: choose the option that smoothly fits local logic AND global theme.
-
-ROLE: ${roleConfig.name}
-STYLE FOCUS: ${roleConfig.styleHint}
-- Base: overall balance of logic, vocabulary, and reading.
-- Lexical: pay extra attention to word choice, connotation, collocations, and idioms.
-- Logic: focus on causality, contrast, and consistency of arguments.
-- Reading: focus on discourse structure, paragraph roles, and main idea.
-- Grammar: focus on formal correctness of sentences.
-
-Never reveal or mention this internal reasoning or these rules in your output.`;
-
-  const userPrompt = `OCR TEXT (page ${page}):
-
-${ocrText}
-
-QUESTION NUMBERS TO ANSWER:
-${questionNumbers.join(", ")}
-
-TASK:
-For EACH of the question numbers above, output exactly one line in the form "N: X" where N is the question number and X is one of A, B, C, or D.
-List them in ascending numerical order.
-After the last answer line, output the stop token ${stopToken} on its own line.
-Do NOT include any other text.`;
-
-  const body = {
-    model,
-    temperature,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  };
-
-  const url = "https://openrouter.ai/api/v1/chat/completions";
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await fetch(url, {
+    const res = await fetch(endpoint, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+      body: params,
+      signal: controller.signal,
     });
 
+    const raw = await res.text();
     if (!res.ok) {
-      if (attempt === 1) {
-        throw new Error(`OpenRouter HTTP ${res.status}`);
-      }
-      continue;
+      return {
+        httpOk: false,
+        status: res.status,
+        raw,
+      };
     }
 
-    const data = await res.json();
-    const content = data.choices?.[0]?.message?.content ?? "";
-    return String(content);
-  }
-
-  throw new Error("OpenRouter request failed twice");
-}
-
-// "1: A" 형태의 줄들을 파싱해서 { [번호]: "A" } 형태로 변환
-function parseAnswersFromText(raw, questionNumbers) {
-  const map = {};
-  if (!raw) return map;
-  const text = String(raw);
-
-  // 모델 출력에 붙어 있을 수 있는 stop token(XURTH)을 잘라낸다.
-  const stopIndex = text.indexOf("XURTH");
-  const trimmed = stopIndex >= 0 ? text.slice(0, stopIndex) : text;
-
-  const lines = trimmed.split(/\r?\n/);
-  const allowed = new Set(questionNumbers);
-  const lineRegex = /^\s*(\d{1,2})\s*[:\.]\s*([A-D])\b/i;
-
-  for (const line of lines) {
-    const m = lineRegex.exec(line);
-    if (!m) continue;
-    const n = parseInt(m[1], 10);
-    const choice = m[2].toUpperCase();
-    if (!allowed.has(n)) continue;
-    if (["A", "B", "C", "D"].includes(choice)) {
-      map[n] = choice;
+    let parsed = null;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return {
+        httpOk: false,
+        status: res.status,
+        raw,
+        parseError: "JSON parse error: " + String(e && e.message ? e.message : e),
+      };
     }
-  }
 
-  return map;
+    return {
+      httpOk: true,
+      status: res.status,
+      raw,
+      json: parsed,
+    };
+  } catch (e) {
+    return {
+      httpOk: false,
+      status: null,
+      raw: null,
+      fetchError: String(e && e.message ? e.message : e),
+    };
+  } finally {
+    clearTimeout(id);
+  }
 }
 
 exports.handler = async (event) => {
@@ -175,146 +157,143 @@ exports.handler = async (event) => {
       return json(405, { ok: false, error: "POST only" });
     }
 
-    const apiKey = process.env.OPENROUTER_API_KEY;
+    const apiKey = process.env.OCR_SPACE_API_KEY;
     if (!apiKey) {
-      return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
+      return json(500, { ok: false, error: "OCR_SPACE_API_KEY is not set" });
     }
 
-    const model = process.env.MODEL_NAME || "openai/gpt-4.1";
-    const stopToken = process.env.STOP_TOKEN || "XURTH";
-    const temperature = Number(process.env.TEMPERATURE ?? 0.1);
+    const primaryEndpoint =
+      process.env.OCR_SPACE_API_ENDPOINT ||
+      "https://apipro1.ocr.space/parse/image";
+    const backupEndpoint =
+      process.env.OCR_SPACE_API_ENDPOINT_BACKUP ||
+      "https://apipro2.ocr.space/parse/image";
+
+    let timeoutMs = Number(process.env.OCR_SPACE_TIMEOUT_MS || "30000");
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      timeoutMs = 30000;
+    }
 
     let body = {};
     try {
       body = JSON.parse(event.body || "{}");
-    } catch (e) {
+    } catch {
       return json(400, { ok: false, error: "Invalid JSON body" });
     }
 
     const page = body.page ?? 1;
-    const ocrText = String(body.ocrText || body.text || "");
+    const image = body.image || body.base64Image || "";
 
-    if (!ocrText.trim()) {
-      return json(400, { ok: false, error: "Missing ocrText" });
+    if (typeof image !== "string" || !image.trim()) {
+      return json(400, { ok: false, error: "Missing image (dataURL base64)" });
     }
 
-    const { visibleQuestionNumbers, questionNumbers } = extractQuestionNumbers(ocrText);
+    const base64Image = image.trim(); // 이미 data:image/...;base64,... 형식이라고 가정
 
-    if (!questionNumbers.length) {
-      return json(200, {
-        ok: true,
-        text: "",
-        debug: {
-          model,
-          temperature,
-          page,
-          questionNumbers: [],
-          visibleQuestionNumbers: [],
-          answers: {},
-          voteDetail: {},
-          ensembleUsed: false,
-          runs: [],
-          ocrPreview: ocrText.slice(0, 800),
-        },
-      });
-    }
+    // 1차: primary endpoint
+    const primary = await callOcrSpaceOnce(
+      primaryEndpoint,
+      apiKey,
+      base64Image,
+      timeoutMs
+    );
 
-    // OpenRouter에 여러 역할로 요청 보내서 앙상블 투표
-    const runs = [];
-    for (let i = 0; i < ROLE_CONFIGS.length; i++) {
-      const roleConfig = ROLE_CONFIGS[i];
-      try {
-        const content = await callOpenRouter(
-          apiKey,
-          model,
-          temperature,
-          stopToken,
-          roleConfig,
-          ocrText,
-          page,
-          questionNumbers,
-        );
-        const answers = parseAnswersFromText(content, questionNumbers);
-        runs.push({ index: i, roleName: roleConfig.name, questionNumbers, answers, finishReason: "stop" });
-      } catch (e) {
-        runs.push({ index: i, roleName: roleConfig.name, questionNumbers, answers: {}, finishReason: "error" });
-      }
-    }
+    let useResult = primary;
+    let usedEndpoint = primaryEndpoint;
+    let fromBackup = false;
 
-    const voteDetail = {};
-    const finalAnswers = {};
-
-    for (const q of questionNumbers) {
-      const counts = { A: 0, B: 0, C: 0, D: 0 };
-      for (const run of runs) {
-        const ch = run.answers?.[q];
-        if (ch && counts[ch] !== undefined) counts[ch]++;
-      }
-      voteDetail[q] = { ...counts };
-      let bestChoice = "A";
-      let bestCount = -1;
-      let secondCount = -1;
-      for (const ch of ["A", "B", "C", "D"]) {
-        const c = counts[ch];
-        if (c > bestCount) {
-          secondCount = bestCount;
-          bestCount = c;
-          bestChoice = ch;
-        } else if (c > secondCount) {
-          secondCount = c;
-        }
-      }
-      // 만약 모든 run 이 실패해서 전부 0이면, 기본값으로 A를 넣되 첫 번째 run 의 값을 우선 사용
-      if (bestCount === 0) {
-        for (const run of runs) {
-          const ch = run.answers?.[q];
-          if (ch && ["A", "B", "C", "D"].includes(ch)) {
-            bestChoice = ch;
-            break;
+    // primary가 http 에러/타임아웃/JSON에러/exitCode 에러 등일 때 backup 시도
+    let extractedPrimary = null;
+    if (primary.httpOk && primary.json) {
+      extractedPrimary = extractOcrResult(primary.json);
+      if (!extractedPrimary.ok) {
+        // OCR.Space가 에러라고 판단한 경우만 backup 고려
+        if (backupEndpoint && backupEndpoint !== primaryEndpoint) {
+          await sleep(1000);
+          const backup = await callOcrSpaceOnce(
+            backupEndpoint,
+            apiKey,
+            base64Image,
+            timeoutMs
+          );
+          if (backup.httpOk && backup.json) {
+            const extractedBackup = extractOcrResult(backup.json);
+            if (extractedBackup.ok) {
+              useResult = backup;
+              usedEndpoint = backupEndpoint;
+              fromBackup = true;
+              extractedPrimary = null;
+            } else {
+              // backup도 OCR 실패 → 그대로 primary 기준으로 에러 리턴
+              useResult = primary;
+            }
+          } else {
+            // backup도 HTTP/타임아웃 실패 → 그대로 primary 기준으로 에러 리턴
+            useResult = primary;
           }
         }
       }
-      finalAnswers[q] = bestChoice;
     }
 
-    const unsureList = [];
-    for (const q of questionNumbers) {
-      const counts = voteDetail[q];
-      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-      const top = sorted[0][1];
-      const second = sorted[1][1];
-      // 표 차이가 거의 없거나, 표가 너무 적으면 UNSURE에 넣기
-      if (top <= 1 || top - second <= 1) {
-        unsureList.push(q);
-      }
+    // 최종 useResult를 기반으로 응답 만들기
+    if (!useResult.httpOk) {
+      // HTTP 레벨 실패 / fetch 에러
+      return json(200, {
+        ok: false,
+        error: "HTTP or fetch error when calling OCR.Space",
+        page,
+        endpoint: usedEndpoint,
+        status: useResult.status ?? null,
+        fetchError: useResult.fetchError ?? null,
+        raw: useResult.raw ? String(useResult.raw).slice(0, 2000) : null,
+      });
     }
 
-    const lines = [];
-    for (const q of questionNumbers) {
-      lines.push(`${q}: ${finalAnswers[q]}`);
+    if (!useResult.json) {
+      // JSON 파싱 실패
+      return json(200, {
+        ok: false,
+        error: "Failed to parse OCR.Space JSON",
+        page,
+        endpoint: usedEndpoint,
+        status: useResult.status ?? null,
+        raw: useResult.raw ? String(useResult.raw).slice(0, 2000) : null,
+        parseError: useResult.parseError ?? null,
+      });
     }
-    lines.push(`UNSURE: ${unsureList.length ? unsureList.join(", ") : "(none)"}`);
 
-    const textOut = lines.join("\n");
+    // 실제 OCR 결과 추출
+    const extracted = extractOcrResult(useResult.json);
+    if (!extracted.ok) {
+      return json(200, {
+        ok: false,
+        error: "OCR.Space returned error",
+        page,
+        endpoint: usedEndpoint,
+        exitCode: extracted.exitCode ?? null,
+        isErroredOnProcessing: extracted.isErroredOnProcessing ?? null,
+        reason: extracted.reason ?? null,
+        raw: useResult.raw ? String(useResult.raw).slice(0, 2000) : null,
+      });
+    }
 
+    // 성공: 기존처럼 ok:true + text. (meta/raw 는 추가 정보일 뿐)
     return json(200, {
       ok: true,
-      text: textOut,
-      debug: {
-        model,
-        temperature,
-        page,
-        questionNumbers,
-        visibleQuestionNumbers,
-        answers: finalAnswers,
-        voteDetail,
-        ensembleUsed: true,
-        runs,
-        ocrPreview: ocrText.slice(0, 800),
-      },
+      text: extracted.text,
+      page,
+      endpoint: usedEndpoint,
+      fromBackup,
+      meta: extracted.meta,
+      // raw 전체는 로그 길이 방지를 위해 조금만 보냄 (필요시 늘려도 됨)
+      raw: useResult.raw ? String(useResult.raw).slice(0, 2000) : null,
     });
-  } catch (err) {
-    return json(500, { ok: false, error: String(err && err.message ? err.message : err) });
+  } catch (e) {
+    // 최상위 예외
+    return json(200, {
+      ok: false,
+      error: "Unhandled error in ocr function",
+      detail: String(e && e.message ? e.message : e),
+    });
   }
 };
-
