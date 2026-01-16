@@ -99,8 +99,8 @@ async function callOcrSpaceOnce(endpoint, apiKey, base64Image, timeoutMs) {
     params.append("apikey", apiKey);
     params.append("base64Image", base64Image);
 
-    // ✅ (수정된 1줄) 한국어 포함 인식을 위해 auto 사용
-    params.append("language", "auto");
+    // ✅ 영어 문제지 전용: 영어만 인식하도록 eng 사용
+    params.append("language", "eng");
 
     params.append("OCREngine", "2");
     params.append("scale", "true");
@@ -297,3 +297,4 @@ exports.handler = async (event) => {
     });
   }
 };
+
