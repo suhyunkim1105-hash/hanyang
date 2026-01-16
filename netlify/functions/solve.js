@@ -1,524 +1,467 @@
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>answer-site</title>
-  <style>
-    :root { color-scheme: dark; }
-    body {
-      margin:0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background:#0b1020; color:#e9eefc;
+// netlify/functions/solve.js
+// --------------------------------------
+// 역할: 한국외대 편입 영어 객관식 기출 "정답만" 생성하는 함수 (멀티 프롬프트 + 가중 다수결)
+// 입력: { ocrText: string, page?: number }
+// 출력: { ok: true, text: "1: A\n2: D\n...", debug: {...} } 또는 { ok: false, error: "..." }
+//
+// 필요한 환경변수 (Netlify 에서 설정):
+// - OPENROUTER_API_KEY  (필수)
+// - MODEL_NAME          (선택, 예: "openai/gpt-4.1", 기본값: "openai/gpt-4.1")
+// - TEMPERATURE         (선택, 기본 0)
+// - STOP_TOKEN          (선택, 현재는 응답 텍스트에 별도로 사용하지 않음)
+
+"use strict";
+
+function json(statusCode, obj) {
+  return {
+    statusCode,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+    body: JSON.stringify(obj),
+  };
+}
+
+// OpenRouter 호출 함수
+async function callOpenRouter({ apiKey, model, systemPrompt, userContent, temperature }) {
+  const url = "https://openrouter.ai/api/v1/chat/completions";
+
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
+    ],
+    temperature,
+    max_tokens: 512,
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`OpenRouter error: ${res.status} ${res.statusText} ${text}`);
+  }
+
+  const data = await res.json();
+  const choice = data.choices && data.choices[0];
+  if (!choice || !choice.message || typeof choice.message.content !== "string") {
+    throw new Error("OpenRouter response format error");
+  }
+
+  return {
+    text: choice.message.content.trim(),
+    finishReason: choice.finish_reason || "stop",
+  };
+}
+
+// OCR 텍스트에서 문항 번호 추출 (1~50, "1.", "2)" 등)
+function extractQuestionNumbers(ocrText) {
+  const nums = new Set();
+
+  const re = /(?:^|\s|\[)(\d{1,2})[.)](?=\s)/g;
+  let m;
+  while ((m = re.exec(ocrText)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 50) nums.add(n);
+  }
+
+  const arr = Array.from(nums);
+  arr.sort((a, b) => a - b);
+  return arr;
+}
+
+// 선택지 정규화: A/B/C/D 이외는 null 로 처리 (투표에서 제외)
+function normalizeChoice(ch) {
+  if (!ch) return null;
+  const upper = String(ch).trim().toUpperCase();
+  if (["A", "B", "C", "D"].includes(upper)) return upper;
+  return null;
+}
+
+// 모델 응답(문자열)에서 "번호: 선택지" 파싱
+function parseAnswersFromModelOutput(output, questionNumbers) {
+  const wanted = new Set(questionNumbers);
+  const answers = {};
+
+  const lines = String(output || "").split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    // 패턴: "7: B" 또는 "7 - B"
+    const m = line.match(/^(\d{1,2})\s*[:\-]\s*([A-Za-z])/);
+    if (!m) continue;
+
+    const q = parseInt(m[1], 10);
+    if (!wanted.has(q)) continue;
+
+    const choice = normalizeChoice(m[2]);
+    if (!choice) continue;
+
+    if (answers[q] == null) {
+      answers[q] = choice; // 같은 번호 여러 번 나오면 첫 번째만 사용
     }
-    .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
-    .card {
-      background:#0f1835;
-      border:1px solid rgba(255,255,255,.08);
-      border-radius: 18px;
-      padding: 16px;
-      margin-bottom: 14px;
-      box-shadow: 0 8px 30px rgba(0,0,0,.25);
+  }
+
+  return answers;
+}
+
+// OCR 텍스트에서 문항 유형 감지 (외대 전용이지만 다른 연도에도 동작하게 설계)
+function detectQuestionTypes(ocrText) {
+  const types = {
+    grammarIncorrect: new Set(), // "grammatically INCORRECT" 유형
+    referent: new Set(),         // "what it refers to" 유형
+  };
+
+  if (!ocrText) return types;
+  const text = String(ocrText);
+
+  // [18-19] Choose the one that makes the sentence grammatically INCORRECT.
+  const reGrammarRange = /\[(\d{1,2})\s*[-~]\s*(\d{1,2})\]\s*Choose the one that.*grammatically\s+INCORRECT/gi;
+  let m;
+  while ((m = reGrammarRange.exec(text)) !== null) {
+    const s = parseInt(m[1], 10);
+    const e = parseInt(m[2], 10);
+    if (Number.isNaN(s) || Number.isNaN(e)) continue;
+    const from = Math.min(s, e);
+    const to = Math.max(s, e);
+    for (let q = from; q <= to; q++) {
+      types.grammarIncorrect.add(q);
     }
-    h2 { margin:0 0 10px 0; font-size: 18px; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    button {
-      background:#2b6cff;
-      border:none;
-      color:white;
-      padding:10px 14px;
-      border-radius: 12px;
-      font-weight: 700;
-      cursor:pointer;
-      font-size: 13px;
+  }
+
+  // 단일 문항 형식: "18. Choose the one that ... grammatically INCORRECT."
+  const reGrammarSingle = /(\d{1,2})\.\s*Choose the one that.*grammatically\s+INCORRECT/gi;
+  while ((m = reGrammarSingle.exec(text)) !== null) {
+    const q = parseInt(m[1], 10);
+    if (!Number.isNaN(q)) {
+      types.grammarIncorrect.add(q);
     }
-    button.secondary { background:#243055; }
-    button.danger { background:#b8234a; }
-    button:disabled { opacity:.55; cursor:not-allowed; }
-    input {
-      background:#0b1020; color:#e9eefc;
-      border:1px solid rgba(255,255,255,.14);
-      border-radius: 10px; padding:10px 12px;
+  }
+
+  // 참조 대상 비교: "Which of the following is different from the others in what it refers to"
+  const reReferent1 = /(\d{1,2})\.\s*Which of the following is different from the others in what it refers to/gi;
+  while ((m = reReferent1.exec(text)) !== null) {
+    const q = parseInt(m[1], 10);
+    if (!Number.isNaN(q)) {
+      types.referent.add(q);
     }
-    .previewWrap {
-      height: 70vh;
-      min-height: 360px;
-      border-radius: 18px;
-      overflow:hidden;
-      background:#050a18;
-      border:1px solid rgba(255,255,255,.08);
+  }
+
+  // 조금 느슨한 버전 (혹시 wording이 살짝 달라지는 연도 대비)
+  const reReferent2 = /(\d{1,2})\.\s*Which of the following .*what it refers to/gi;
+  while ((m = reReferent2.exec(text)) !== null) {
+    const q = parseInt(m[1], 10);
+    if (!Number.isNaN(q)) {
+      types.referent.add(q);
     }
-    video { width:100%; height:100%; object-fit: contain; background:#000; }
-    .hint { opacity:.8; font-size: 13px; line-height: 1.5; margin-top: 10px; }
-    pre {
-      margin:0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-size: 12px;
-      line-height: 1.45;
+  }
+
+  return types;
+}
+
+// 멀티 프롬프트 정의 (5개 관점: base / lexical / logic / grammar / referent)
+function buildPromptSpecs(stopToken) {
+  const stopInfo = stopToken
+    ? `\n- 절대 "${stopToken}" 같은 STOP 토큰은 출력하지 마라.`
+    : "";
+
+  // 공통 시스템 규칙
+  const commonRules = `
+너는 한국외대 편입 영어 객관식 시험(T1/T2) 전용 AI다.
+
+규칙(공통):
+- 문제는 모두 4지선다형이며, 보기 A/B/C/D 네 개만 존재한다.
+- 정답은 반드시 대문자 A, B, C, D 중 하나여야 한다.
+- E, F 등의 보기는 존재하지 않으니 절대 사용하지 마라.
+- 주어진 "문항 번호 목록"에 있는 번호는 모두 빠짐없이 정답을 내야 한다 (누락 금지).
+- 한국어/한글 지문(제목, 안내문 등)이 OCR에 섞여 있어도 무시하고, 영어 문장과 번호/보기만 활용하라.
+- 최종 출력 형식:
+  - 각 줄에 "번호: 선택지" 형태로만 출력 (예: "7: B").
+  - 다른 텍스트(해설, 이유, 설명, 요약, 문장)는 한 글자도 출력하지 마라.
+${stopInfo}
+
+특수 유형 처리(모든 모드 공통으로 인지해야 함):
+- "Choose the one that makes the sentence grammatically INCORRECT."가 포함된 문항 범위에서는
+  - 각 번호(①~④) 부분을 한 번씩 떼어보며, 문장 구조·시제·수일치·관계사·대명사 호응 등을 점검하고,
+  - 가장 명백하게 문법 규칙을 어기는 번호 하나만 INCORRECT로 선택한다.
+- 'NOT', 'NEVER', 'EXCEPT', 'LEAST'가 있는 문항에서는
+  - positive/negative 논리를 정확하게 파악한 뒤, 조건에 맞는 보기 하나를 고른다.
+- "Which of the following is different from the others in what it refers to?" 와 같은 문항에서는
+  - (A)(B)(C)(D)가 각각 정확히 무엇을 가리키는지 머릿속에 표를 만든 뒤,
+  - 셋과 다른 대상을 가리키는 선택지 하나만 고른다.
+`;
+
+  return [
+    {
+      roleName: "base",
+      systemPrompt:
+        commonRules +
+        `
+모드: 종합 풀이 모드
+- 어휘, 문법, 논리, 지시어, 독해를 모두 균형 있게 고려한다.
+- 가장 '정답처럼 보이는' 선택지를 전반적으로 고르는 기본 모드다.
+`,
+    },
+    {
+      roleName: "lexical",
+      systemPrompt:
+        commonRules +
+        `
+모드: 어휘/유의어 집중 모드
+- 밑줄 친 단어, 괄호 안 단어 등 어휘 문제에서 특히 정확한 의미 매칭에 집중하라.
+- 각 보기의 사전적 정의를 머릿속으로 한국어로 번역해 보고, 문맥에 가장 잘 들어맞는 것을 선택하라.
+- 형태가 비슷한 단어(consolidation / consonance 등)는 반드시 사전적 정의를 비교한 뒤 결정하라.
+`,
+    },
+    {
+      roleName: "logic",
+      systemPrompt:
+        commonRules +
+        `
+모드: 논리/함정 검증 모드
+- NOT, EXCEPT, LEAST, INCORRECT 등 함정 표현을 먼저 체크하고 부정/이중부정, 비교·대조, 조건문(if, unless)을 정밀하게 분석한다.
+- 문장/지문 전체 흐름을 기준으로, 논리적으로 모순이 없는 선택지만 남기고 나머지는 버려라.
+- 지시어(it, they, this, that, such, those, (A) 등)의 지칭 대상이 모호한 문제에서는
+  문맥을 통해 '무엇'을 가리키는지 먼저 찾은 뒤, 그 의미와 가장 잘 대응되는 보기를 고른다.
+`,
+    },
+    {
+      roleName: "grammar",
+      systemPrompt:
+        commonRules +
+        `
+모드: 문법/오류 탐지 특화 모드
+- "grammatically INCORRECT" 문항에서는:
+  1) 전체 문장을 ①~④ 각 부분별로 나누어 본다.
+  2) 시제, 수일치, 관계대명사/관계절, 분사/준동사, 대명사 참조, 전치사 등 문법 규칙 위반을 찾는다.
+  3) 단순 어색함이 아니라 명백한 문법 오류를 만드는 부분을 선택한다.
+- 그 외 문항에서도 문법적으로 말이 되지 않는 보기가 있으면 적극적으로 배제하라.
+`,
+    },
+    {
+      roleName: "referent",
+      systemPrompt:
+        commonRules +
+        `
+모드: 지시어/참조 대상 분석 특화 모드
+- "what it refers to", "refer to", "Which of the following refers to" 등 지시어 관련 문항에서:
+  1) 문제에 등장하는 각 표현(A, B, C, D 또는 (A)(B)(C)(D))이 정확히 무엇을 가리키는지 문장/문단을 따라가며 확인한다.
+  2) 각 표현과 대응되는 대상(사람, 집단, 사건, 추상 개념 등)을 머릿속 표로 정리한다.
+  3) 세 표현은 같은 대상을 가리키고, 하나만 다른 대상을 가리키면, 그 '하나'를 정답으로 고른다.
+- 긴 독해 지문에서도 대명사/지시어의 참조가 애매하면 우선 그 참조 관계부터 확정한 뒤 선택지를 비교하라.
+`,
+    },
+  ];
+}
+
+// user prompt 생성
+function buildUserPrompt(ocrText, questionNumbers, questionTypes) {
+  const numListStr = questionNumbers.join(", ");
+
+  let typeHintLines = "";
+
+  if (questionTypes) {
+    const grammarArr = Array.from(questionTypes.grammarIncorrect || []);
+    const referentArr = Array.from(questionTypes.referent || []);
+    if (grammarArr.length) {
+      typeHintLines += `- 문법적으로 INCORRECT(오류 찾기) 유형 문항: ${grammarArr.join(", ")}\n`;
     }
-    textarea {
-      width:100%; min-height: 160px; resize: vertical;
-      background:#0b1020; color:#e9eefc;
-      border:1px solid rgba(255,255,255,.14);
-      border-radius: 12px; padding:12px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 12px;
+    if (referentArr.length) {
+      typeHintLines += `- 지시어/참조 대상 비교 유형 문항: ${referentArr.join(", ")}\n`;
     }
-    .small { font-size: 12px; opacity: .85; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h2>카메라 / 자동 문제풀이</h2>
-      <div class="row" style="margin-bottom:8px;">
-        <button id="btnStart">카메라 시작</button>
-        <button id="btnShot" class="secondary">현재 페이지 촬영</button>
-        <span class="small">현재 페이지</span>
-        <input id="page" type="number" value="1" min="1" style="width:90px" />
-        <span id="res" class="small"></span>
-      </div>
-      <div class="row" style="margin-bottom:8px;">
-        <button id="btnTtsTest" class="secondary">음성 테스트</button>
-        <button id="btnAutoStart">자동 문제풀이 시작</button>
-        <button id="btnAutoStop" class="danger">자동 문제풀이 정지</button>
-      </div>
+  }
 
-      <div class="previewWrap">
-        <video id="video" playsinline autoplay muted></video>
-      </div>
+  return `
+다음은 한국외대 편입 영어 객관식 시험지 일부의 OCR 결과이다.
 
-      <div class="hint">
-        ① 시험지를 화면에 꽉 채우고<br/>
-        ② 글자/문항번호/보기(A~E)까지 선명하게 보이게 맞춘 뒤<br/>
-        ③ 자동 문제풀이를 켜면, 페이지마다<br/>
-        &nbsp;&nbsp;&nbsp;- <b>“페이지 인식, 1 2 3”</b> (예고 TTS)<br/>
-        &nbsp;&nbsp;&nbsp;- 촬영 → OCR → 정답 생성 → 정답 음성 낭독 순서로 반복.
-      </div>
-    </div>
+- 이 OCR 텍스트 안에는 여러 문항(번호와 보기)이 포함되어 있다.
+- 너는 아래 "문항 번호 목록"에 포함된 모든 문항에 대해 정답을 골라야 한다.
+- 각 문항의 정답은 보기 A, B, C, D 중 하나다.
+- 최종 출력은 오직 "번호: 선택지" 형식의 줄들만 포함해야 한다.
 
-    <!-- 정답 카드: 카메라 바로 아래로 이동 -->
-    <div class="card">
-      <h2>정답</h2>
-      <div class="small">정답은 "1: A" 같은 형식 + 마지막 줄에 UNSURE: ... 로 나옴. 음성으로도 읽어줌.</div>
-      <div style="height:10px"></div>
-      <textarea id="ansBox" placeholder="정답 결과가 여기에 표시됨" readonly></textarea>
-    </div>
+문항 번호 목록: ${numListStr}
+${typeHintLines ? "\n문항 유형 힌트:\n" + typeHintLines : ""}
 
-    <div class="card">
-      <h2>로그</h2>
-      <pre id="log"></pre>
-    </div>
+OCR 텍스트:
+"""
+${ocrText}
+"""
 
-    <div class="card">
-      <h2>OCR 원문 확인</h2>
-      <div class="small">여기서 OCR이 얼마나 제대로 뽑혔는지 즉시 확인해. (정답률의 핵심)</div>
-      <div style="height:10px"></div>
-      <textarea id="ocrBox" placeholder="OCR 결과가 여기에 표시됨" readonly></textarea>
-    </div>
-  </div>
+위 정보를 바탕으로, 지정된 모든 문항 번호에 대한 정답만 계산해서 출력하라.
+`;
+}
 
-  <script>
-    const $ = (id) => document.getElementById(id);
+// 다수결 앙상블 (문항 유형에 따라 일부 역할에 가중치 부여)
+function majorityVote(questionNumbers, runs, questionTypes) {
+  const finalAnswers = {};
+  const voteDetail = {};
 
-    const video   = $("video");
-    const logEl   = $("log");
-    const ocrBox  = $("ocrBox");
-    const ansBox  = $("ansBox");
-    const btnShot = $("btnShot");
-    const btnStart = $("btnStart");
-    const btnTtsTest = $("btnTtsTest");
-    const btnAutoStart = $("btnAutoStart");
-    const btnAutoStop  = $("btnAutoStop");
-    const resEl  = $("res");
+  for (const q of questionNumbers) {
+    const counts = {};
+    const isGrammarIncorrect =
+      questionTypes &&
+      questionTypes.grammarIncorrect &&
+      questionTypes.grammarIncorrect.has(q);
+    const isReferent =
+      questionTypes &&
+      questionTypes.referent &&
+      questionTypes.referent.has(q);
 
-    function ts() {
-      const d = new Date();
-      const hh = String(d.getHours()).padStart(2,"0");
-      const mm = String(d.getMinutes()).padStart(2,"0");
-      const ss = String(d.getSeconds()).padStart(2,"0");
-      return `${hh}:${mm}:${ss}`;
+    for (const run of runs) {
+      const choice = run.answers[q];
+      if (!choice) continue;
+
+      // 기본 가중치 1, 특정 유형에 따라 role별로 가중치 부여
+      let weight = 1;
+
+      if (isGrammarIncorrect && run.roleName === "grammar") {
+        weight = 2; // 문법 문제에서 grammar 모드 가중치↑
+      } else if (isReferent && run.roleName === "referent") {
+        weight = 2; // 참조 문제에서 referent 모드 가중치↑
+      }
+
+      const key = choice;
+      counts[key] = (counts[key] || 0) + weight;
     }
 
-    function log(msg) {
-      logEl.textContent += `[${ts()}] ${msg}\n`;
-      logEl.scrollTop = logEl.scrollHeight;
+    let bestChoice = null;
+    let bestCount = -1;
+
+    for (const [choice, cnt] of Object.entries(counts)) {
+      if (cnt > bestCount) {
+        bestChoice = choice;
+        bestCount = cnt;
+      }
     }
 
-    let stream = null;
-    let busy = false;       // 수동 촬영 락
-    let autoMode = false;   // 자동 모드 on/off
-    let autoTimer = null;
-    let lastOcrNonEmpty = false; // 직전 자동 OCR에서 글자가 있었는지
-    let wakeLock = null;
-
-    // ---- 공통 유틸 ----
-    function sleep(ms) {
-      return new Promise((resolve) => setTimeout(resolve, ms));
+    // 투표가 하나도 없으면 base run 결과에 fallback, 그것도 없으면 A로.
+    if (!bestChoice) {
+      const baseRun = runs.find((r) => r.roleName === "base") || runs[0];
+      const fallback = baseRun && baseRun.answers[q];
+      finalAnswers[q] = normalizeChoice(fallback) || "A";
+    } else {
+      finalAnswers[q] = bestChoice;
     }
 
-    // ---- 카메라 ----
-    async function startCamera() {
-      if (stream) return;
+    voteDetail[q] = counts;
+  }
 
-      log("STATUS: 카메라를 켜고, 페이지 1부터 한 페이지씩 촬영해.");
+  return { finalAnswers, voteDetail };
+}
 
-      const constraints = {
-        audio: false,
-        video: {
-          facingMode: { ideal: "environment" },
-          width:  { min: 1280, ideal: 1920 },
-          height: { min: 720,  ideal: 1080 },
-        }
-      };
+// Netlify handler
+exports.handler = async (event) => {
+  try {
+    if (event.httpMethod !== "POST") {
+      return json(405, { ok: false, error: "POST only" });
+    }
 
-      stream = await navigator.mediaDevices.getUserMedia(constraints);
-      video.srcObject = stream;
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
+    }
 
-      await new Promise((r) => {
-        video.onloadedmetadata = () => r();
+    const model = process.env.MODEL_NAME || "openai/gpt-4.1";
+    const temperature = Number(process.env.TEMPERATURE ?? 0);
+    const stopToken = process.env.STOP_TOKEN || "";
+
+    let body = {};
+    try {
+      body = JSON.parse(event.body || "{}");
+    } catch {
+      return json(400, { ok: false, error: "Invalid JSON body" });
+    }
+
+    const page = body.page ?? 1;
+    const ocrText = String(body.ocrText || body.text || "");
+
+    if (!ocrText.trim()) {
+      return json(400, { ok: false, error: "ocrText is empty" });
+    }
+
+    const questionNumbers = extractQuestionNumbers(ocrText);
+    if (!questionNumbers.length) {
+      return json(400, {
+        ok: false,
+        error: "No question numbers detected in OCR text",
+      });
+    }
+
+    const questionTypes = detectQuestionTypes(ocrText);
+
+    const promptSpecs = buildPromptSpecs(stopToken);
+    const userPrompt = buildUserPrompt(ocrText, questionNumbers, questionTypes);
+
+    const runs = [];
+
+    for (const spec of promptSpecs) {
+      const { roleName, systemPrompt } = spec;
+      const { text: modelText, finishReason } = await callOpenRouter({
+        apiKey,
+        model,
+        systemPrompt,
+        userContent: userPrompt,
+        temperature,
       });
 
-      try {
-        const track = stream.getVideoTracks()[0];
-        await track.applyConstraints({
-          advanced: [
-            { width: 1920, height: 1080 },
-            { width: 1280, height: 720 }
-          ]
-        });
-      } catch (_) {}
+      const answers = parseAnswersFromModelOutput(modelText, questionNumbers);
 
-      setTimeout(() => {
-        const vw = video.videoWidth;
-        const vh = video.videoHeight;
-        resEl.textContent = vw && vh ? `캠 해상도: ${vw}×${vh}` : "";
-        log("STATUS: 카메라가 켜졌어. 시험지를 화면에 꽉 차게 맞춰줘.");
-      }, 200);
-    }
-
-    function captureDataURL() {
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-      if (!vw || !vh) throw new Error("Video not ready");
-
-      const canvas = document.createElement("canvas");
-      canvas.width = vw;
-      canvas.height = vh;
-
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, vw, vh);
-
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
-      return { dataUrl, vw, vh, length: dataUrl.length };
-    }
-
-    async function doOCR(page, dataUrl) {
-      const res = await fetch("/.netlify/functions/ocr", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ page, image: dataUrl }),
-      });
-      const data = await res.json().catch(() => ({}));
-      return { ok: res.ok && data.ok, ...data };
-    }
-
-    async function doSolve(page, ocrText) {
-      const res = await fetch("/.netlify/functions/solve", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ page, ocrText }),
-      });
-      const data = await res.json().catch(() => ({}));
-      return { ok: res.ok && data.ok, ...data };
-    }
-
-    // ---- Wake Lock (화면 꺼짐 방지) ----
-    async function enableWakeLock() {
-      try {
-        if ("wakeLock" in navigator && !wakeLock) {
-          wakeLock = await navigator.wakeLock.request("screen");
-          wakeLock.addEventListener("release", () => {
-            log("STATUS: 화면 꺼짐 방지(wake lock) 해제됨.");
-            wakeLock = null;
-          });
-          log("STATUS: 화면 꺼짐 방지(wake lock) 설정됨.");
-        }
-      } catch (e) {
-        log(`STATUS: wake lock 설정 실패: ${e?.message || e}`);
-      }
-    }
-
-    async function disableWakeLock() {
-      try {
-        if (wakeLock) {
-          await wakeLock.release();
-          wakeLock = null;
-          log("STATUS: 화면 꺼짐 방지(wake lock) 해제됨.");
-        }
-      } catch (e) {
-        // 무시
-      }
-    }
-
-    // ---- TTS ----
-    let ttsEnabled = false;
-
-    function speakNow(text) {
-      return new Promise((resolve) => {
-        if (!("speechSynthesis" in window)) return resolve();
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.lang = "ko-KR";  // 유사 '유나' 스타일 한국어 여성 보이스 선택될 가능성↑
-        utter.rate = 1.0;
-        utter.pitch = 1.0;
-        utter.onend = () => resolve();
-        utter.onerror = () => resolve();
-        window.speechSynthesis.speak(utter);
+      runs.push({
+        index: runs.length,
+        roleName,
+        questionNumbers,
+        answers,
+        finishReason,
       });
     }
 
-    async function speakTest() {
-      ttsEnabled = true;
-      await speakNow("테스트");
-      log("STATUS: 음성 테스트를 재생했어. 이후 자동 풀이 정답도 소리로 읽어줄게.");
-    }
+    const { finalAnswers, voteDetail } = majorityVote(
+      questionNumbers,
+      runs,
+      questionTypes
+    );
 
-    // ★ 여기: 페이지 인식 1 2 3 (예고용)
-    async function speakPageCountdown() {
-      if (!ttsEnabled) return;
-      await speakNow("페이지 인식, 일");
-      await sleep(400);
-      await speakNow("이");
-      await sleep(400);
-      await speakNow("삼");
-    }
+    const lines = questionNumbers.map((q) => `${q}: ${finalAnswers[q]}`);
+    const outText = lines.join("\n");
 
-    function parseSolveTextForTts(text) {
-      const items = [];
-      let unsureList = [];
+    const ocrPreview = ocrText.length > 400 ? ocrText.slice(0, 400) : ocrText;
 
-      const lines = String(text || "").split(/\r?\n/);
-      for (const raw of lines) {
-        const ln = raw.trim();
-        if (!ln) continue;
-
-        let m = ln.match(/^(\d{1,3})\s*:\s*([A-E]|[1-5])\b/i);
-        if (m) {
-          const num = Number(m[1]);
-          const ans = m[2].toUpperCase();
-          items.push({ num, ans });
-          continue;
-        }
-        m = ln.match(/^UNSURE\s*:\s*(.+)$/i);
-        if (m) {
-          const parts = m[1].split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
-          unsureList = parts.map(x => Number(x)).filter(n => !isNaN(n));
-        }
-      }
-      return { items, unsure: unsureList };
-    }
-
-    // ★ 여기만 수정: ABCDE를 숫자(1~5)로 읽도록 변경
-    async function speakAnswers(text) {
-      if (!ttsEnabled) return;
-      const { items, unsure } = parseSolveTextForTts(text);
-
-      for (const { num, ans } of items) {
-        let choiceNumber = null;
-
-        // solve가 A~E로 줄 때 → 1~5번으로 매핑
-        if ("ABCDE".includes(ans)) {
-          const map = { A: 1, B: 2, C: 3, D: 4, E: 5 };
-          choiceNumber = map[ans] ?? null;
-        }
-        // 혹시 이미 1~5로 들어오면 그대로 사용
-        else if ("12345".includes(ans)) {
-          choiceNumber = Number(ans);
-        }
-
-        let spokenAns;
-        if (choiceNumber != null) {
-          spokenAns = `${choiceNumber}번`;
-        } else {
-          // 예외 상황(문자 이상)에서는 그냥 원문 읽기
-          spokenAns = ans;
-        }
-
-        // "19번, 1번" 이런 식으로 읽음
-        await speakNow(`${num}번, ${spokenAns}`);
-        await sleep(1500); // 문항 사이 1.5초 정도 쉼
-      }
-
-      if (unsure.length) {
-        await speakNow(`불확실한 번호, ${unsure.join(", ")}`);
-        await sleep(1500);
-      }
-    }
-
-    // ---- 수동 촬영 ----
-    btnStart.addEventListener("click", async () => {
-      try {
-        await startCamera();
-        await enableWakeLock();
-      } catch (e) {
-        log(`STATUS: 카메라 실패: ${e?.message || e}`);
-      }
+    return json(200, {
+      ok: true,
+      text: outText,
+      debug: {
+        page,
+        model,
+        temperature,
+        questionNumbers,
+        visibleQuestionNumbers: questionNumbers,
+        answers: finalAnswers,
+        voteDetail,
+        ensembleUsed: true,
+        runs,
+        questionTypes: {
+          grammarIncorrect: Array.from(questionTypes.grammarIncorrect || []),
+          referent: Array.from(questionTypes.referent || []),
+        },
+        ocrTextPreview: ocrPreview,
+      },
     });
-
-    btnShot.addEventListener("click", async () => {
-      if (busy) return;
-      busy = true;
-      btnShot.disabled = true;
-
-      try {
-        await startCamera();
-
-        const page = Number($("page").value || 1);
-
-        log(`STATUS: 페이지 ${page} 촬영 중... 시험지를 흔들리지 않게 잡고 있어줘.`);
-        const cap = captureDataURL();
-        log(`capture size ${JSON.stringify({ width: cap.vw, height: cap.vh, length: Math.floor(cap.length/4) })}`);
-
-        log("STATUS: OCR 처리 중...");
-        const ocr = await doOCR(page, cap.dataUrl);
-        log(`OCR response ${JSON.stringify(ocr).slice(0, 1200)}`);
-
-        if (!ocr.ok) {
-          log(`STATUS: OCR 실패: ${ocr.error || "Unknown"}${ocr.detail ? " / " + ocr.detail : ""}`);
-          return;
-        }
-
-        ocrBox.value = ocr.text || "";
-
-        log(`STATUS: OCR 완료 (평균 신뢰도: ${ocr.conf ?? 0}, 번호 패턴 수: ${ocr.hits ?? 0}). 이제 정답을 생성할게.`);
-        const solved = await doSolve(page, ocr.text || "");
-        log(`solve response ${JSON.stringify(solved).slice(0, 1200)}`);
-
-        if (!solved.ok) {
-          log(`STATUS: solve 실패: ${solved.error || "Unknown"}`);
-          if (ttsEnabled) await speakNow("실패");
-          return;
-        }
-
-        ansBox.value = solved.text || "";
-        log(`STATUS: 페이지 ${page} 정답을 생성했어.`);
-        await speakAnswers(solved.text || "");
-      } catch (e) {
-        log(`STATUS: 처리 실패: ${e?.message || e}`);
-      } finally {
-        busy = false;
-        btnShot.disabled = false;
-      }
+  } catch (err) {
+    return json(500, {
+      ok: false,
+      error: err && err.message ? err.message : String(err),
     });
-
-    // ---- 자동 문제풀이 ----
-    const AUTO_EMPTY_RETRY_MS = 4000;
-    const AUTO_AFTER_SOLVE_MS = 5000;
-
-    function scheduleAutoStep(delayMs) {
-      if (!autoMode) return;
-      if (autoTimer) clearTimeout(autoTimer);
-      autoTimer = setTimeout(() => {
-        autoStep().catch((e) => {
-          log(`STATUS: [자동] 처리 실패: ${e?.message || e}`);
-          scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
-        });
-      }, delayMs);
-    }
-
-    async function autoStep() {
-      if (!autoMode) return;
-      const page = Number($("page").value || 1);
-
-      // ★ 이미 한 번 이상 텍스트가 인식된 이후에는, 다음 촬영 전에 "페이지 인식 1 2 3" 예고
-      if (lastOcrNonEmpty) {
-        log("STATUS: [자동] 페이지 인식 1 2 3 (예고).");
-        await speakPageCountdown();
-      }
-
-      log(`STATUS: [자동] 페이지 ${page} 촬영 중... 시험지를 흔들리지 않게 잡고 있어줘.`);
-      const cap = captureDataURL();
-      log(`capture size ${JSON.stringify({ width: cap.vw, height: cap.vh, length: Math.floor(cap.length/4) })}`);
-
-      log("STATUS: [자동] OCR 처리 중...");
-      const ocr = await doOCR(page, cap.dataUrl);
-      log(`OCR response ${JSON.stringify(ocr).slice(0, 1200)}`);
-
-      if (!ocr.ok) {
-        log(`STATUS: [자동] OCR 실패: ${ocr.error || "Unknown"}${ocr.detail ? " / " + ocr.detail : ""}`);
-        if (ttsEnabled) await speakNow("실패");
-        scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
-        return;
-      }
-
-      const text = (ocr.text || "").trim();
-      if (!text) {
-        lastOcrNonEmpty = false;
-        log("STATUS: [자동] 아직 인식할 시험지가 없는 것 같아. 잠시 후 다시 시도할게.");
-        scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
-        return;
-      }
-
-      lastOcrNonEmpty = true;
-      ocrBox.value = ocr.text || "";
-      log(`STATUS: [자동] OCR 완료 (평균 신뢰도: ${ocr.conf ?? 0}, 번호 패턴 수: ${ocr.hits ?? 0}). 이제 정답을 생성할게.`);
-
-      const solved = await doSolve(page, ocr.text || "");
-      log(`solve response ${JSON.stringify(solved).slice(0, 1200)}`);
-
-      if (!solved.ok) {
-        log(`STATUS: [자동] solve 실패: ${solved.error || "Unknown"}`);
-        if (ttsEnabled) await speakNow("실패");
-        scheduleAutoStep(AUTO_EMPTY_RETRY_MS);
-        return;
-      }
-
-      ansBox.value = solved.text || "";
-      log(`STATUS: [자동] 페이지 ${page} 정답을 생성했어.`);
-
-      await speakAnswers(solved.text || "");
-
-      // 다음 페이지/동일 페이지 다시 인식까지 5초 쉼
-      scheduleAutoStep(AUTO_AFTER_SOLVE_MS);
-    }
-
-    btnAutoStart.addEventListener("click", async () => {
-      if (autoMode) return;
-      try {
-        await startCamera();
-        await enableWakeLock();
-        autoMode = true;
-        lastOcrNonEmpty = false;
-        log("STATUS: 자동 문제풀이 모드를 시작할게.");
-        scheduleAutoStep(0);
-      } catch (e) {
-        log(`STATUS: 자동 모드 시작 실패: ${e?.message || e}`);
-      }
-    });
-
-    btnAutoStop.addEventListener("click", async () => {
-      if (!autoMode) return;
-      autoMode = false;
-      if (autoTimer) {
-        clearTimeout(autoTimer);
-        autoTimer = null;
-      }
-      await disableWakeLock();
-      log("STATUS: 자동 문제풀이 모드를 종료할게.");
-    });
-
-    btnTtsTest.addEventListener("click", () => {
-      speakTest();
-    });
-
-    // 페이지 나갈 때 wake lock 해제
-    window.addEventListener("beforeunload", () => {
-      autoMode = false;
-      if (autoTimer) clearTimeout(autoTimer);
-      disableWakeLock();
-    });
-  </script>
-</body>
-</html>
+  }
+};
 
