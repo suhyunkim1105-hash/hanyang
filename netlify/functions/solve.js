@@ -4,7 +4,7 @@
 // - Fixed: model = openai/gpt-4.1, temperature = 0.1
 // - Removed: stop token usage entirely
 // Input: { ocrText: string, page?: number } OR { pages: [{page:number, text:string}] }
-// Output: { ok:true, text:"1: A\n2: D\n... (1..50)", debug:{...} }
+// Output: { ok:true, text:"14: B\n15: D\n...", debug:{...} }  // ONLY detected question numbers
 //
 // Required env:
 // - OPENROUTER_API_KEY
@@ -32,19 +32,12 @@ function safeStr(x) {
 }
 
 // ========== OCR NORMALIZATION (your rules) ==========
-// 1) Choices: always A) B) C) D)
-//    OCR variants: A. A> A: ① etc -> normalize
-// 2) Underline marker: wrap only underlined token as <...> (we accept OCR-bracket noise)
-// 3) Blank: always BLANK (no underscores)
-// 4) Separators: ——
-// 5) Use only <> (avoid mixing (), [])
 function normalizeOcr(text) {
   let t = safeStr(text);
 
-  // unify newlines
   t = t.replace(/\r\n?/g, "\n");
 
-  // normalize long dashes to "——" if 4+ dash-like chars
+  // normalize long dashes to "——"
   t = t.replace(/[—–\-＿_]{4,}/g, "——");
   t = t.replace(/(\s*-\s*){4,}/g, "——");
 
@@ -55,35 +48,32 @@ function normalizeOcr(text) {
   t = t.replace(/\[\s*\]/g, "BLANK");
   t = t.replace(/<\s*>/g, "BLANK");
 
-  // normalize circled choices to A)B)C)D)
+  // circled choices -> A) B) C) D)
   t = t
     .replace(/①/g, "A)")
     .replace(/②/g, "B)")
     .replace(/③/g, "C)")
     .replace(/④/g, "D)");
 
-  // normalize choice markers like A. A> A: A -  (only when it looks like a choice marker)
+  // choice markers like A. A> A: -> A)
   t = t.replace(/(^|\n|\s)([A-D])\s*[\.\:\>\-]\s+/g, "$1$2) ");
   t = t.replace(/(^|\n|\s)([A-D])\s+\.\s+/g, "$1$2) ");
   t = t.replace(/(^|\n|\s)([A-D])\s*\)\s+/g, "$1$2) ");
 
-  // bracket noise -> angle brackets (LIMITED heuristic)
-  // Convert [token], (token), {token} -> <token> when token is short and no spaces.
+  // bracket noise -> angle brackets (only short token, no spaces)
   t = t.replace(/[\[\(\{]([A-Za-z0-9_\-]{1,30})[\]\)\}]/g, "<$1>");
-  // Also cleanup "< token >"
   t = t.replace(/<\s*([A-Za-z0-9_\-]{1,50})\s*>/g, "<$1>");
 
-  // inline (A)(B)(C)(D) references -> <A><B><C><D>
+  // inline (A) [A] -> <A>
   t = t.replace(/\(([A-D])\)/g, "<$1>");
   t = t.replace(/\[([A-D])\]/g, "<$1>");
 
-  // compress whitespace
   t = t.replace(/[ \t]{2,}/g, " ");
 
   return t.trim();
 }
 
-// Collect question numbers (1..50) to debug “what OCR contained”
+// Collect question numbers (1..50)
 function collectQuestionNumbers(text) {
   const seen = new Set();
   const t = "\n" + safeStr(text) + "\n";
@@ -106,11 +96,7 @@ function collectQuestionNumbers(text) {
   return Array.from(seen).sort((a, b) => a - b);
 }
 
-// ========== PROMPT ==========
-// We embed TWO things:
-// (A) verified paper-structure (by question number ranges)
-// (B) your trend analysis as PRIOR (9/8/4/29) to bias type inference, not to hardcode answers
-function buildPrompt(normalizedText, seenNums) {
+function buildPrompt(normalizedText, detectedNums) {
   const verifiedStructure = `
 [VERIFIED HUFS T2/T2-1 PAPER STRUCTURE (by question ranges)]
 - Q1-4  : sentence completion (short, usually vocab/usage)
@@ -127,8 +113,7 @@ function buildPrompt(normalizedText, seenNums) {
 [TREND PRIOR (your analysis)]
 - Total 50 questions, 4 choices only (A/B/C/D).
 - Category counts are stable across years in your analysis: Vocabulary 9, Grammar+Restatement 8, Logic 4, Reading 29.
-- IMPORTANT: Use this as a PRIOR to recognize the likely type, but NEVER force any fixed answer by number.
-- Practical mapping hint (soft): Reading is overwhelmingly Q22-50. Many grammar/error items cluster around Q18-21.
+- Use this ONLY as a soft PRIOR to recognize question type (never force fixed answers by number).
 `;
 
   const yourRules = `
@@ -137,29 +122,26 @@ function buildPrompt(normalizedText, seenNums) {
 - Underlined tokens appear as <...>
 - Blanks appear as BLANK
 - Separators may appear as —— between blocks/pages
-- Brackets may be noisy; treat <> as the only underline/marker format
+- Brackets may be noisy; treat <> as the only marker format
 `;
 
   const outputRules = `
 [OUTPUT RULES - ABSOLUTE]
-- Output EXACTLY 50 lines, from 1 to 50.
+- Output ONLY for the following detected question numbers:
+  ${detectedNums.join(", ")}
 - Each line format: "n: A" or "n: B" or "n: C" or "n: D"
-- If OCR is missing/garbled for that question, still pick one but add "?" like "n: B?"
-- No explanations, no extra text, no blank lines.
+- If uncertain, add '?' like "n: B?"
+- Output ONLY those lines. No extra lines, no explanations, no blank lines.
 `;
 
-  const seenLine = `Seen question numbers detected from OCR (may be incomplete): ${seenNums.length ? seenNums.join(", ") : "(none)"}`;
-
   return `
-You are a specialized solver for HUFS (Korea University of Foreign Studies) transfer English T2/T2-1.
+You are a specialized solver for HUFS transfer English T2/T2-1.
 Your ONLY goal is maximizing answer accuracy from noisy OCR text.
 
 ${verifiedStructure}
 ${trendPrior}
 ${yourRules}
 ${outputRules}
-
-${seenLine}
 
 [OCR TEXT START]
 ${normalizedText}
@@ -177,36 +159,42 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-// Parse model output and FORCE 1..50 lines even if model misses some.
-function extractAnswers(modelText) {
+// Parse model output only for detected question numbers
+function extractAnswersForDetected(modelText, detectedNums) {
+  const want = new Set(detectedNums);
+  const got = new Map();
+
   const lines = safeStr(modelText)
     .split(/\r?\n/)
     .map((s) => s.trim())
     .filter(Boolean);
 
-  const map = new Map();
-
   for (const line of lines) {
     const m = line.match(/^(\d{1,2})\s*:\s*([ABCD])(\?)?$/);
     if (!m) continue;
     const n = Number(m[1]);
-    if (n < 1 || n > 50) continue;
+    if (!want.has(n)) continue;
     const letter = m[2];
     const unsure = !!m[3];
-    map.set(n, letter + (unsure ? "?" : ""));
+    got.set(n, letter + (unsure ? "?" : ""));
   }
 
+  // Ensure "no missing among detected" if model forgets: fill with A?
   const out = [];
+  const missing = [];
   const unsureNums = [];
 
-  for (let n = 1; n <= 50; n++) {
-    let v = map.get(n);
-    if (!v) v = "A?"; // missing line fallback (keeps "no missing numbers" rule)
+  for (const n of detectedNums) {
+    let v = got.get(n);
+    if (!v) {
+      v = "A?";
+      missing.push(n);
+    }
     if (v.endsWith("?")) unsureNums.push(n);
     out.push(`${n}: ${v}`);
   }
 
-  return { text: out.join("\n"), unsureNums };
+  return { text: out.join("\n"), missing, unsureNums };
 }
 
 exports.handler = async (event) => {
@@ -217,12 +205,11 @@ exports.handler = async (event) => {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
 
-    // FIXED per your request
+    // FIXED
     const model = "openai/gpt-4.1";
     const temperature = 0.1;
-    const maxTokens = 900;
+    const maxTokens = 700;
 
-    // Parse body
     let body = {};
     try {
       body = JSON.parse(event.body || "{}");
@@ -252,8 +239,7 @@ exports.handler = async (event) => {
 
     const normalized = normalizeOcr(ocrText);
 
-    // Prevent overload / mobile huge OCR (avoid server lag)
-    // Keep head+tail which usually preserves stems+choices across pages.
+    // Avoid overload
     const MAX_CHARS = 45000;
     let clipped = normalized;
     let clippedInfo = null;
@@ -264,11 +250,20 @@ exports.handler = async (event) => {
       clippedInfo = { originalChars: normalized.length, usedChars: clipped.length };
     }
 
-    const seenNums = collectQuestionNumbers(clipped);
-    const prompt = buildPrompt(clipped, seenNums);
+    const detectedNums = collectQuestionNumbers(clipped);
+
+    // If none detected, do NOT hallucinate 1-50. Return empty.
+    if (detectedNums.length === 0) {
+      return json(200, {
+        ok: true,
+        text: "",
+        debug: { model, temperature, detectedNums, note: "No question numbers detected" },
+      });
+    }
+
+    const prompt = buildPrompt(clipped, detectedNums);
 
     const url = "https://openrouter.ai/api/v1/chat/completions";
-
     const payload = {
       model,
       temperature,
@@ -277,13 +272,12 @@ exports.handler = async (event) => {
         {
           role: "system",
           content:
-            "Return only the 50 answer lines. No explanations. If uncertain, add '?' after the letter.",
+            "Return only the requested answer lines. No explanations. If uncertain, add '?' after the letter.",
         },
         { role: "user", content: prompt },
       ],
     };
 
-    // Retry (network hiccups)
     let lastErr = null;
     const attempts = 3;
 
@@ -315,7 +309,7 @@ exports.handler = async (event) => {
 
         if (!raw.trim()) throw new Error("Empty model output");
 
-        const { text, unsureNums } = extractAnswers(raw);
+        const { text, missing, unsureNums } = extractAnswersForDetected(raw, detectedNums);
 
         return json(200, {
           ok: true,
@@ -324,7 +318,8 @@ exports.handler = async (event) => {
             model,
             temperature,
             maxTokens,
-            seenNums,
+            detectedNums,
+            missingFilledWithAq: missing,
             unsureNums,
             clippedInfo,
           },
