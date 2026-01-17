@@ -1,255 +1,204 @@
 // netlify/functions/solve.js
-// ------------------------------------------------------------
-// HUFS(한국외대) 편입영어 T2 전용: "지금 OCR에서 감지된 문항번호만" 정답 생성
+// HUFS(외대) 편입영어 T2 전용: "보이는 문항번호만" 정답 생성 (4지선다, 1~50)
 // - 모델: openai/gpt-4.1 고정
 // - temperature: 0.1 고정
-// - stop token 사용/설정/전달: 전부 제거
-// - 보기: 4지선다(1~4)만
-// - 핵심: 지문/구간표/숫자 잡음 때문에 "이상한 문항번호"가 섞이는 문제를 강하게 차단
+// - stop token: 사용 안 함
+// - 특정 연도/번호 정답 강제: 절대 없음
+// - OCR 깨짐(A. A> A: / (A) [A] {A}) 정규화 + 문항번호 오탐(범위표기) 방지
 //
-// 입력(JSON):
-// { ocrText: string, page?: number }
-// 출력(JSON):
-// { ok: true, text: "8: 2\n9: 4\n...", debug: {...} }
+// 입력: { ocrText: string, page?: number }
+// 출력: { ok:true, text:"15: 2\n16: 1\n...", debug:{...} }
 
 function json(statusCode, obj) {
   return {
     statusCode,
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
+      "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
     },
     body: JSON.stringify(obj),
   };
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function uniq(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    if (!seen.has(x)) {
+      seen.add(x);
+      out.push(x);
+    }
+  }
+  return out;
 }
 
-function normalizeText(input) {
-  let t = String(input || "");
+// 1) OCR 텍스트 정규화: 보기/표식/BLANK/특수괄호
+function normalizeOcr(raw) {
+  let t = String(raw || "");
 
-  // Normalize newlines
+  // 통일된 줄바꿈
   t = t.replace(/\r\n?/g, "\n");
 
-  // Normalize common OCR chevrons/angle quotes used to indicate underlines
-  // ‹word›, 〈word〉, «word», 《word》 -> <word>
+  // OCR에서 나오는 특수 괄호/따옴표를 일반 문자로
   t = t
-    .replace(/[‹〈«《]/g, "<")
-    .replace(/[›〉»》]/g, ">");
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[‹«]/g, "<")
+    .replace(/[›»]/g, ">");
 
-  // Fix cases like "<precipitous)" -> "<precipitous>"
-  t = t.replace(/<([^>\n]{1,40})\)/g, "<$1>");
-
-  // Normalize blanks: ____ -> BLANK
+  // BLANK 통일 (____, ___, _ _ 등)
   t = t.replace(/_{2,}/g, "BLANK");
+  t = t.replace(/\bBLANK\b/gi, "BLANK");
 
-  // Normalize passage markers: (A), （A）, (A/when) -> <A>
-  t = t.replace(/[（(]\s*([ABCD])\s*[）)]/g, "<$1>");
-  t = t.replace(/[（(]\s*([ABCD])\s*[/|:]\s*/g, "<$1> ");
-  // Also handle "A/when" without parentheses (rare)
-  t = t.replace(/\b([ABCD])\s*\/\s*/g, "<$1> ");
+  // (A) [A] {A}  -> <A>  (a,b,c,d도 동일)
+  t = t.replace(/[\(\[\{]\s*([A-Da-d])\s*[\)\]\}]/g, "<$1>");
+  // 혹시 < a > 같이 띄어쓰기 들어가면 정리
+  t = t.replace(/<\s*([A-Da-d])\s*>/g, "<$1>");
 
-  // Normalize option labels:
-  // Circled digits (①②③④ etc.) -> A)B)C)D)
-  const circledMap = [
-    [/[\u2460\u2776]/g, "A)"], // ① ❶
-    [/[\u2461\u2777]/g, "B)"], // ② ❷
-    [/[\u2462\u2778]/g, "C)"], // ③ ❸
-    [/[\u2463\u2779]/g, "D)"], // ④ ❹
-  ];
-  for (const [re, rep] of circledMap) t = t.replace(re, rep);
+  // 보기 라벨(A. A: A> 등) -> A)
+  // "줄 시작" 또는 "줄 중간에서 보기 나열" 둘 다 커버하려고 약하게 2번 처리
+  t = t.replace(/(^|\n)\s*([A-Da-d])\s*[\.\:\>]\s+/g, "$1$2) ");
+  t = t.replace(/\s([A-Da-d])\s*[\.\:\>]\s+/g, " $1) ");
 
-  // If OCR breaks A) as "A." "A:" "A>" etc at line starts, normalize to A)
-  t = t.replace(/(^|\n)\s*([ABCD])\s*[\.\:\>\)]\s+/g, "$1$2) ");
+  // 보기 라벨이 "A "만 있고 점이 누락되는 케이스: "A unflappable" 형태
+  // 단, 너무 과하면 본문 A(약어)도 바꿀 수 있어서 "보기 4개가 근처에 있을 때"가 아니라면 위험.
+  // 여기서는 안전하게: "A " 다음에 소문자 단어가 오고, 같은 줄에 B/C/D가 같이 있는 패턴만 최소 변환
+  t = t.replace(
+    /(^|\n)(.*?)(\bA\s+[a-z][^\n]*\bB\s+[a-z][^\n]*\bC\s+[a-z][^\n]*\bD\s+[a-z][^\n]*)/g,
+    (m, p1, p2, p3) => {
+      let s = p3;
+      s = s.replace(/\bA\s+/g, "A) ");
+      s = s.replace(/\bB\s+/g, "B) ");
+      s = s.replace(/\bC\s+/g, "C) ");
+      s = s.replace(/\bD\s+/g, "D) ");
+      return p1 + (p2 || "") + s;
+    }
+  );
 
-  // Reduce some noisy double spaces
-  t = t.replace(/[ \t]{2,}/g, " ");
+  // <a> <b> <c> <d>는 <A> <B> <C> <D>로 통일 (네 규칙)
+  t = t.replace(/<a>/g, "<A>").replace(/<b>/g, "<B>").replace(/<c>/g, "<C>").replace(/<d>/g, "<D>");
 
+  // 너무 많은 공백 정리
+  t = t.replace(/[ \t]+/g, " ");
   return t.trim();
 }
 
-// Strictly detect question numbers as line-start "n." or "n)"
-function detectQuestionNumbersStrict(text) {
-  const nums = new Set();
-  const lines = text.split("\n");
+// 2) 문항번호 탐지(오탐 방지 핵심)
+// - "줄 시작"에서 "숫자 + '.' or ')'"만 문항 시작으로 인정
+// - 1~50만
+function detectQuestionNumbers(text) {
+  const lines = String(text || "").split("\n");
+  const nums = [];
   for (const line of lines) {
-    const s = line.trimStart();
-    // skip bracketed range lines like "[18-30: ...]"
-    if (s.startsWith("[") || s.startsWith("]")) continue;
-    const m = s.match(/^(\d{1,2})\s*[\.\)]\s+/);
+    const m = line.match(/^\s*(\d{1,2})\s*([.)])\s+/);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (!(n >= 1 && n <= 50)) continue;
+    nums.push(n);
+  }
+  return uniq(nums);
+}
+
+// 3) "연속 구간 스캔"인데 OCR이 중간을 누락했을 때도 번호 누락 0을 맞추기
+//    - 예: 15,16,17,18,19,22,23이 들어오면 20,21을 ?로라도 출력해야 함
+function expandExpectedGaps(detected) {
+  const nums = [...detected].sort((a, b) => a - b);
+  if (nums.length < 3) return detected;
+
+  const min = nums[0];
+  const max = nums[nums.length - 1];
+  const span = max - min;
+
+  // 너무 넓으면(예: 1~50) 억지 확장 X
+  if (span > 15) return detected;
+
+  const set = new Set(nums);
+
+  // 기본: min..max 사이 결손 보완
+  for (let n = min; n <= max; n++) set.add(n);
+
+  // 추가 규칙(외대 구조 반영):
+  // 18~19가 있고 22/23이 있으면 20~21은 그 사이에 있어야 함
+  if (set.has(18) && set.has(19) && (set.has(22) || set.has(23))) {
+    set.add(20);
+    set.add(21);
+  }
+
+  return [...set].sort((a, b) => a - b);
+}
+
+// 4) 너무 긴 OCR 텍스트(독해 구간)로 렉/토큰 폭발 방지: "필요한 구간만" 잘라서 모델에 전달
+function clipToRelevant(text, targetNums) {
+  const t = String(text || "");
+  if (t.length <= 14000) return { clipped: t, clippedInfo: null };
+
+  const lines = t.split("\n");
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\s*(\d{1,2})\s*([.)])\s+/);
     if (m) {
       const n = Number(m[1]);
-      if (n >= 1 && n <= 50) nums.add(n);
+      if (n >= 1 && n <= 50) starts.push({ idx: i, n });
     }
   }
-  return Array.from(nums).sort((a, b) => a - b);
+  if (starts.length === 0) {
+    return { clipped: t.slice(0, 14000), clippedInfo: { mode: "hard", keptChars: 14000 } };
+  }
+
+  // 문항 시작점 기준으로 블록 만들기
+  const blocks = [];
+  for (let k = 0; k < starts.length; k++) {
+    const a = starts[k];
+    const b = starts[k + 1];
+    const from = a.idx;
+    const to = b ? b.idx : lines.length;
+    blocks.push({ n: a.n, from, to });
+  }
+
+  // 타겟 문항 + 인접 문항(±1) 블록을 모아 붙임 (지문 이어짐 방지용)
+  const want = new Set(targetNums);
+  for (const n of targetNums) {
+    want.add(n - 1);
+    want.add(n + 1);
+  }
+
+  const kept = [];
+  for (const blk of blocks) {
+    if (want.has(blk.n)) kept.push(...lines.slice(blk.from, blk.to));
+  }
+
+  // 그래도 너무 짧거나 비면: 앞 200줄 + 뒤 200줄 안전망
+  let out = kept.join("\n").trim();
+  if (!out) {
+    out = lines.slice(0, 200).join("\n") + "\n...\n" + lines.slice(-200).join("\n");
+  }
+
+  // 최종 길이 제한
+  if (out.length > 14000) out = out.slice(0, 14000);
+
+  return { clipped: out, clippedInfo: { mode: "blocks", originalChars: t.length, keptChars: out.length } };
 }
 
-// Fallback detection: if strict finds none, try looser but still guarded
-function detectQuestionNumbersFallback(text) {
-  const nums = new Set();
-  // Find patterns like "\n 18 " where near it there is "A)" / "Choose" / "Which"
-  const re = /(^|\n)\s*(\d{1,2})\s+(?=.{0,60}(A\)|B\)|C\)|D\)|Choose|Which))/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const n = Number(m[2]);
-    if (n >= 1 && n <= 50) nums.add(n);
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(id);
   }
-  return Array.from(nums).sort((a, b) => a - b);
-}
-
-function detectQuestionNumbers(text) {
-  const strict = detectQuestionNumbersStrict(text);
-  if (strict.length > 0) return strict;
-  return detectQuestionNumbersFallback(text);
-}
-
-function buildRelevantExcerpt(text, qnums) {
-  // We want to include enough context BEFORE each question
-  // (especially reading passages), but avoid sending whole OCR trash.
-  // Strategy: make windows around each detected question start index.
-  const indices = [];
-
-  for (const n of qnums) {
-    const re = new RegExp(`(^|\\n)\\s*${n}\\s*[\\.|\\)]\\s+`, "g");
-    const m = re.exec(text);
-    if (m && typeof m.index === "number") {
-      indices.push({ n, idx: m.index });
-    }
-  }
-  indices.sort((a, b) => a.idx - b.idx);
-
-  if (indices.length === 0) {
-    // As a last resort, return head
-    return text.slice(0, 12000);
-  }
-
-  const windows = [];
-  const len = text.length;
-
-  for (let i = 0; i < indices.length; i++) {
-    const { n, idx } = indices[i];
-    const before = n >= 22 ? 3200 : 1400; // 독해는 지문이 필요하므로 더 크게
-    const after = 2600;
-
-    const start = Math.max(0, idx - before);
-    const end = Math.min(len, idx + after);
-    windows.push([start, end]);
-  }
-
-  // Merge overlapping windows
-  windows.sort((a, b) => a[0] - b[0]);
-  const merged = [];
-  for (const w of windows) {
-    const last = merged[merged.length - 1];
-    if (!last || w[0] > last[1]) merged.push(w);
-    else last[1] = Math.max(last[1], w[1]);
-  }
-
-  let excerpt = merged.map(([s, e]) => text.slice(s, e)).join("\n\n---\n\n");
-
-  // Hard cap to avoid model overload / latency
-  if (excerpt.length > 14000) excerpt = excerpt.slice(0, 14000);
-
-  return excerpt;
-}
-
-function mapChoiceToDigit(x) {
-  const s = String(x || "").trim().toUpperCase();
-  if (s === "A") return "1";
-  if (s === "B") return "2";
-  if (s === "C") return "3";
-  if (s === "D") return "4";
-  if (["1", "2", "3", "4"].includes(s)) return s;
-  return null;
-}
-
-function parseAnswers(modelText, targetNums) {
-  const answers = new Map();
-  const text = String(modelText || "");
-
-  // Accept:
-  // "18: 4" , "18 - 4" , "18: D"
-  const re = /(^|\n)\s*(\d{1,2})\s*[:\-]\s*([1-4ABCD])\b/gi;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const n = Number(m[2]);
-    if (!targetNums.includes(n)) continue;
-    const digit = mapChoiceToDigit(m[3]);
-    if (digit) answers.set(n, digit);
-  }
-
-  return answers;
-}
-
-async function callOpenRouter({ apiKey, model, temperature, prompt, maxTokens }) {
-  const url = "https://openrouter.ai/api/v1/chat/completions";
-
-  const body = {
-    model,
-    temperature,
-    max_tokens: maxTokens,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a precise test-solver for HUFS transfer English (50 questions, 4 choices).\n" +
-          "You MUST output ONLY the requested question numbers, each as: n: 1|2|3|4\n" +
-          "No explanations, no extra lines, no missing numbers.\n" +
-          "If choices are labeled A/B/C/D, map A=1, B=2, C=3, D=4.\n" +
-          "If choices are labeled ①②③④, treat them as 1..4 in that order.\n" +
-          "Markers: BLANK means a blank. Underlined words may be wrapped in <...>. Passage markers may be <A><B><C><D>.\n" +
-          "HUFS typical structure hint (do NOT assume answers):\n" +
-          "- 1-13 Vocabulary (1 point): 1-4 sentence completion; 5-9 replace underlined; 10-13 contextual meaning.\n" +
-          "- 14-17 Grammar/Paraphrase (2 points): 14-15 closest meaning; 16-17 sentence completion.\n" +
-          "- 18-19 choose the underlined segment that makes the sentence grammatically INCORRECT.\n" +
-          "- 20-21 choose the grammatically INCORRECT sentence among four.\n" +
-          "- 22-50 Reading comprehension.",
-      },
-      { role: "user", content: prompt },
-    ],
-  };
-
-  // retries (network/5xx)
-  let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          // Optional OpenRouter headers (safe to omit, but ok to keep)
-          "HTTP-Referer": "https://example.com",
-          "X-Title": "HUFS-T2-Solver",
-        },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`OpenRouter HTTP ${res.status}: ${txt.slice(0, 200)}`);
-      }
-
-      const data = await res.json();
-      const out = data?.choices?.[0]?.message?.content ?? "";
-      return String(out);
-    } catch (e) {
-      lastErr = e;
-      await sleep(250 * (attempt + 1));
-    }
-  }
-  throw lastErr || new Error("OpenRouter failed");
 }
 
 exports.handler = async (event) => {
   try {
-    if (event.httpMethod === "OPTIONS") return json(200, { ok: true });
-    if (event.httpMethod !== "POST") return json(405, { ok: false, error: "POST only" });
+    if (event.httpMethod === "OPTIONS") {
+      return json(200, { ok: true });
+    }
+    if (event.httpMethod !== "POST") {
+      return json(405, { ok: false, error: "POST only" });
+    }
 
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
@@ -261,84 +210,144 @@ exports.handler = async (event) => {
       return json(400, { ok: false, error: "Invalid JSON body" });
     }
 
-    const raw = String(body.ocrText || body.text || "");
     const page = body.page ?? null;
+    const raw = String(body.ocrText || body.text || "");
+    if (!raw.trim()) return json(400, { ok: false, error: "ocrText is empty" });
 
-    const normalized = normalizeText(raw);
-    const qnums = detectQuestionNumbers(normalized);
+    const normalized = normalizeOcr(raw);
 
-    // 렉 방지: 문항번호 감지 0이면 모델 호출 자체를 하지 않는다.
-    if (qnums.length === 0) {
+    // 문항번호 탐지 + (필요시) 누락 번호 보정
+    const detectedNums = detectQuestionNumbers(normalized);
+    const finalNums = expandExpectedGaps(detectedNums);
+
+    if (finalNums.length === 0) {
       return json(200, {
         ok: true,
         text: "",
-        debug: {
-          model: "openai/gpt-4.1",
-          temperature: 0.1,
-          page,
-          detectedNums: [],
-          note: "No question numbers detected (line-start n. / n) pattern).",
-        },
+        debug: { model: "openai/gpt-4.1", temperature: 0.1, page, detectedNums, finalNums, note: "no question numbers detected" },
       });
     }
 
-    // "지금 페이지에서 감지된 번호만" 풀기
-    const excerpt = buildRelevantExcerpt(normalized, qnums);
+    // 긴 텍스트는 필요한 블록만 잘라서 렉/토큰 폭발 방지
+    const { clipped, clippedInfo } = clipToRelevant(normalized, finalNums);
 
-    const prompt =
-      `QUESTION NUMBERS TO ANSWER (ONLY THESE): ${qnums.join(", ")}\n` +
-      `Return EXACTLY one line per number, format: n: 1|2|3|4\n` +
-      `\n=== OCR (normalized excerpt) ===\n` +
-      excerpt;
+    // 모델 출력 토큰: 문항 수에 비례 (독해가 길수록 커짐)
+    const maxTokens = Math.min(1800, Math.max(600, finalNums.length * 80));
 
-    const model = "openai/gpt-4.1";
-    const temperature = 0.1;
+    const prompt = `
+너의 역할: "한국외대(외대) 편입영어 T2 객관식 정답 생성기"다.
 
-    const modelText = await callOpenRouter({
-      apiKey,
-      model,
-      temperature,
-      prompt,
-      maxTokens: 850,
-    });
+[시험 고정 정보]
+- 문항: 1~50
+- 선지: 4개(정답은 1~4로 표현)
+- 자주 나오는 구조(외대 기출 공통):
+  * 1~9: 어휘(동의/문맥 등)
+  * 10~13: 논리완성(짧은 문장/단락의 의미·논리)
+  * 14~21: 문법/재진술(의미 동일, 문장 완성, 문법 오류 찾기)
+  * 18~19: "문법적으로 틀린 부분" 찾기 (<A>/<B>/<C>/<D>로 표시됨)
+  * 20~21: "문법적으로 틀린 문장" 고르기 (A)~D) 중 1개가 오류)
+  * 22~50: 독해(지문 + 문제)
+  * 23(또는 유사 유형): <A>/<B>/<C>/<D>가 가리키는 지시대상이 서로 다른 것을 고르는 문제
 
-    const parsed = parseAnswers(modelText, qnums);
+[입력 텍스트 규칙]
+- 보기 라벨은 A) B) C) D) 로 정규화되어 들어온다.
+- 밑줄/표식은 <...> 형태로 들어올 수 있다.
+- 빈칸은 BLANK 로 들어온다.
+- <A> <B> <C> <D>는 지문/문장 안에서 표시된 위치 토큰이다.
 
-    // Fill missing to guarantee "누락 0"
-    // (정답 강제 X. 단지 출력 누락 방지용. 모르면 1? 로 표시)
-    const lines = [];
-    const missing = [];
-    const unsure = [];
+[최우선 목표]
+- 아래 [정답을 내야 하는 문항 번호]에 대해 "반드시 전부" 한 줄씩 답을 출력한다.
+- 답을 확신 못하면 숫자 뒤에 ?를 붙인다. (예: 18: 4?)
+- 절대로 목록에 없는 문항번호를 출력하지 마라.
 
-    for (const n of qnums) {
-      const a = parsed.get(n);
-      if (a) {
-        lines.push(`${n}: ${a}`);
+[정답을 내야 하는 문항 번호]
+${finalNums.join(", ")}
+
+[출력 형식]
+- 딱 아래 형식만 반복:
+  n: k
+  또는 확신 없으면
+  n: k?
+- 줄바꿈은 허용. 다른 설명 금지.
+`;
+
+    const reqBody = {
+      model: "openai/gpt-4.1",
+      temperature: 0.1,
+      max_tokens: maxTokens,
+      messages: [
+        { role: "system", content: "You solve HUFS transfer English T2 multiple-choice and output only answers in the specified format." },
+        { role: "user", content: prompt + "\n\n[OCR TEXT]\n" + clipped },
+      ],
+    };
+
+    const res = await fetchWithTimeout(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(reqBody),
+      },
+      25000
+    );
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return json(500, { ok: false, error: `OpenRouter error ${res.status}`, detail: errText.slice(0, 3000) });
+    }
+
+    const data = await res.json();
+    const out = String(data?.choices?.[0]?.message?.content || "").trim();
+
+    // 모델 출력 파싱: finalNums에 있는 번호만 남기고 정렬
+    const lineMap = new Map();
+    for (const line of out.split("\n")) {
+      const m = line.trim().match(/^(\d{1,2})\s*:\s*([1-4])(\?)?\s*$/);
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (!finalNums.includes(n)) continue;
+      lineMap.set(n, `${n}: ${m[2]}${m[3] || ""}`);
+    }
+
+    // finalNums 전체를 반드시 출력(누락되면 1?로 채움)
+    const missingFilledWith = [];
+    const finalLines = [];
+    for (const n of finalNums) {
+      if (lineMap.has(n)) {
+        finalLines.push(lineMap.get(n));
       } else {
-        // fallback: mark unsure
-        lines.push(`${n}: 1?`);
-        missing.push(n);
-        unsure.push(n);
+        missingFilledWith.push(n);
+        finalLines.push(`${n}: 1?`);
       }
     }
 
+    const unsureNums = finalLines
+      .filter((s) => s.endsWith("?"))
+      .map((s) => Number(s.split(":")[0].trim()));
+
     return json(200, {
       ok: true,
-      text: lines.join("\n"),
+      text: finalLines.join("\n"),
       debug: {
-        model,
-        temperature,
+        model: "openai/gpt-4.1",
+        temperature: 0.1,
         page,
-        detectedNums: qnums,
-        missingFilledWith: missing,
-        unsureNums: unsure,
-        // for debugging only (trimmed)
-        excerptPreview: excerpt.slice(0, 500),
+        maxTokens,
+        detectedNums,
+        finalNums,
+        missingFilledWith,
+        unsureNums,
+        clippedInfo,
+        excerptPreview: clipped.slice(0, 800),
       },
     });
   } catch (e) {
     return json(500, { ok: false, error: String(e?.message || e) });
   }
 };
+
 
 
