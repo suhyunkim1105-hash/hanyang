@@ -1,22 +1,24 @@
 // netlify/functions/solve.js
 // ------------------------------------------------------------
-// HUFS Transfer English (T2 / T2-1) solver - Answers only
-// - Fixed: model = openai/gpt-4.1, temperature = 0.1
-// - Removed: stop token usage entirely
-// Input: { ocrText: string, page?: number } OR { pages: [{page:number, text:string}] }
-// Output: { ok:true, text:"14: B\n15: D\n...", debug:{...} }  // ONLY detected question numbers
+// HUFS(한국외대) 편입영어 T2 전용: "지금 OCR에서 감지된 문항번호만" 정답 생성
+// - 모델: openai/gpt-4.1 고정
+// - temperature: 0.1 고정
+// - stop token 사용/설정/전달: 전부 제거
+// - 보기: 4지선다(1~4)만
+// - 핵심: 지문/구간표/숫자 잡음 때문에 "이상한 문항번호"가 섞이는 문제를 강하게 차단
 //
-// Required env:
-// - OPENROUTER_API_KEY
-// ------------------------------------------------------------
+// 입력(JSON):
+// { ocrText: string, page?: number }
+// 출력(JSON):
+// { ok: true, text: "8: 2\n9: 4\n...", debug: {...} }
 
 function json(statusCode, obj) {
   return {
     statusCode,
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/json; charset=utf-8",
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type",
       "Access-Control-Allow-Methods": "POST, OPTIONS",
     },
     body: JSON.stringify(obj),
@@ -27,174 +29,221 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function safeStr(x) {
-  return typeof x === "string" ? x : String(x ?? "");
-}
+function normalizeText(input) {
+  let t = String(input || "");
 
-// ========== OCR NORMALIZATION (your rules) ==========
-function normalizeOcr(text) {
-  let t = safeStr(text);
-
+  // Normalize newlines
   t = t.replace(/\r\n?/g, "\n");
 
-  // normalize long dashes to "——"
-  t = t.replace(/[—–\-＿_]{4,}/g, "——");
-  t = t.replace(/(\s*-\s*){4,}/g, "——");
-
-  // blank normalization
-  t = t.replace(/[_]{2,}/g, "BLANK");
-  t = t.replace(/[□■▢▣]+/g, "BLANK");
-  t = t.replace(/\(\s*\)/g, "BLANK");
-  t = t.replace(/\[\s*\]/g, "BLANK");
-  t = t.replace(/<\s*>/g, "BLANK");
-
-  // circled choices -> A) B) C) D)
+  // Normalize common OCR chevrons/angle quotes used to indicate underlines
+  // ‹word›, 〈word〉, «word», 《word》 -> <word>
   t = t
-    .replace(/①/g, "A)")
-    .replace(/②/g, "B)")
-    .replace(/③/g, "C)")
-    .replace(/④/g, "D)");
+    .replace(/[‹〈«《]/g, "<")
+    .replace(/[›〉»》]/g, ">");
 
-  // choice markers like A. A> A: -> A)
-  t = t.replace(/(^|\n|\s)([A-D])\s*[\.\:\>\-]\s+/g, "$1$2) ");
-  t = t.replace(/(^|\n|\s)([A-D])\s+\.\s+/g, "$1$2) ");
-  t = t.replace(/(^|\n|\s)([A-D])\s*\)\s+/g, "$1$2) ");
+  // Fix cases like "<precipitous)" -> "<precipitous>"
+  t = t.replace(/<([^>\n]{1,40})\)/g, "<$1>");
 
-  // bracket noise -> angle brackets (only short token, no spaces)
-  t = t.replace(/[\[\(\{]([A-Za-z0-9_\-]{1,30})[\]\)\}]/g, "<$1>");
-  t = t.replace(/<\s*([A-Za-z0-9_\-]{1,50})\s*>/g, "<$1>");
+  // Normalize blanks: ____ -> BLANK
+  t = t.replace(/_{2,}/g, "BLANK");
 
-  // inline (A) [A] -> <A>
-  t = t.replace(/\(([A-D])\)/g, "<$1>");
-  t = t.replace(/\[([A-D])\]/g, "<$1>");
+  // Normalize passage markers: (A), （A）, (A/when) -> <A>
+  t = t.replace(/[（(]\s*([ABCD])\s*[）)]/g, "<$1>");
+  t = t.replace(/[（(]\s*([ABCD])\s*[/|:]\s*/g, "<$1> ");
+  // Also handle "A/when" without parentheses (rare)
+  t = t.replace(/\b([ABCD])\s*\/\s*/g, "<$1> ");
 
+  // Normalize option labels:
+  // Circled digits (①②③④ etc.) -> A)B)C)D)
+  const circledMap = [
+    [/[\u2460\u2776]/g, "A)"], // ① ❶
+    [/[\u2461\u2777]/g, "B)"], // ② ❷
+    [/[\u2462\u2778]/g, "C)"], // ③ ❸
+    [/[\u2463\u2779]/g, "D)"], // ④ ❹
+  ];
+  for (const [re, rep] of circledMap) t = t.replace(re, rep);
+
+  // If OCR breaks A) as "A." "A:" "A>" etc at line starts, normalize to A)
+  t = t.replace(/(^|\n)\s*([ABCD])\s*[\.\:\>\)]\s+/g, "$1$2) ");
+
+  // Reduce some noisy double spaces
   t = t.replace(/[ \t]{2,}/g, " ");
 
   return t.trim();
 }
 
-// Collect question numbers (1..50)
-function collectQuestionNumbers(text) {
-  const seen = new Set();
-  const t = "\n" + safeStr(text) + "\n";
-
-  // strong: line-start "14." "14)" "14:"
-  const re = /(?:\n|\r)\s*(\d{1,2})\s*[\.\)\:]\s+/g;
-  let m;
-  while ((m = re.exec(t))) {
-    const n = Number(m[1]);
-    if (n >= 1 && n <= 50) seen.add(n);
-  }
-
-  // weak fallback: " 14. "
-  const re2 = /(^|[^\d])(\d{1,2})\s*\./g;
-  while ((m = re2.exec(t))) {
-    const n = Number(m[2]);
-    if (n >= 1 && n <= 50) seen.add(n);
-  }
-
-  return Array.from(seen).sort((a, b) => a - b);
-}
-
-function buildPrompt(normalizedText, detectedNums) {
-  const verifiedStructure = `
-[VERIFIED HUFS T2/T2-1 PAPER STRUCTURE (by question ranges)]
-- Q1-4  : sentence completion (short, usually vocab/usage)
-- Q5-9  : replace the underlined word/phrase (synonym replacement)
-- Q10-13: contextual meaning of the underlined word/phrase
-- Q14-15: closest in meaning (paraphrase / restatement)
-- Q16-17: sentence completion (grammar/word order/structure)
-- Q18-19: choose the underlined segment (A/B/C/D) that makes the sentence grammatically incorrect
-- Q20-21: choose the option sentence (A/B/C/D) that is grammatically incorrect
-- Q22-50: reading passages (all 4-choice A/B/C/D)
-`;
-
-  const trendPrior = `
-[TREND PRIOR (your analysis)]
-- Total 50 questions, 4 choices only (A/B/C/D).
-- Category counts are stable across years in your analysis: Vocabulary 9, Grammar+Restatement 8, Logic 4, Reading 29.
-- Use this ONLY as a soft PRIOR to recognize question type (never force fixed answers by number).
-`;
-
-  const yourRules = `
-[YOUR INPUT RULES (already normalized)]
-- Choices use A) B) C) D)
-- Underlined tokens appear as <...>
-- Blanks appear as BLANK
-- Separators may appear as —— between blocks/pages
-- Brackets may be noisy; treat <> as the only marker format
-`;
-
-  const outputRules = `
-[OUTPUT RULES - ABSOLUTE]
-- Output ONLY for the following detected question numbers:
-  ${detectedNums.join(", ")}
-- Each line format: "n: A" or "n: B" or "n: C" or "n: D"
-- If uncertain, add '?' like "n: B?"
-- Output ONLY those lines. No extra lines, no explanations, no blank lines.
-`;
-
-  return `
-You are a specialized solver for HUFS transfer English T2/T2-1.
-Your ONLY goal is maximizing answer accuracy from noisy OCR text.
-
-${verifiedStructure}
-${trendPrior}
-${yourRules}
-${outputRules}
-
-[OCR TEXT START]
-${normalizedText}
-[OCR TEXT END]
-`.trim();
-}
-
-async function fetchWithTimeout(url, options, timeoutMs) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-// Parse model output only for detected question numbers
-function extractAnswersForDetected(modelText, detectedNums) {
-  const want = new Set(detectedNums);
-  const got = new Map();
-
-  const lines = safeStr(modelText)
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
+// Strictly detect question numbers as line-start "n." or "n)"
+function detectQuestionNumbersStrict(text) {
+  const nums = new Set();
+  const lines = text.split("\n");
   for (const line of lines) {
-    const m = line.match(/^(\d{1,2})\s*:\s*([ABCD])(\?)?$/);
-    if (!m) continue;
-    const n = Number(m[1]);
-    if (!want.has(n)) continue;
-    const letter = m[2];
-    const unsure = !!m[3];
-    got.set(n, letter + (unsure ? "?" : ""));
-  }
-
-  // Ensure "no missing among detected" if model forgets: fill with A?
-  const out = [];
-  const missing = [];
-  const unsureNums = [];
-
-  for (const n of detectedNums) {
-    let v = got.get(n);
-    if (!v) {
-      v = "A?";
-      missing.push(n);
+    const s = line.trimStart();
+    // skip bracketed range lines like "[18-30: ...]"
+    if (s.startsWith("[") || s.startsWith("]")) continue;
+    const m = s.match(/^(\d{1,2})\s*[\.\)]\s+/);
+    if (m) {
+      const n = Number(m[1]);
+      if (n >= 1 && n <= 50) nums.add(n);
     }
-    if (v.endsWith("?")) unsureNums.push(n);
-    out.push(`${n}: ${v}`);
+  }
+  return Array.from(nums).sort((a, b) => a - b);
+}
+
+// Fallback detection: if strict finds none, try looser but still guarded
+function detectQuestionNumbersFallback(text) {
+  const nums = new Set();
+  // Find patterns like "\n 18 " where near it there is "A)" / "Choose" / "Which"
+  const re = /(^|\n)\s*(\d{1,2})\s+(?=.{0,60}(A\)|B\)|C\)|D\)|Choose|Which))/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const n = Number(m[2]);
+    if (n >= 1 && n <= 50) nums.add(n);
+  }
+  return Array.from(nums).sort((a, b) => a - b);
+}
+
+function detectQuestionNumbers(text) {
+  const strict = detectQuestionNumbersStrict(text);
+  if (strict.length > 0) return strict;
+  return detectQuestionNumbersFallback(text);
+}
+
+function buildRelevantExcerpt(text, qnums) {
+  // We want to include enough context BEFORE each question
+  // (especially reading passages), but avoid sending whole OCR trash.
+  // Strategy: make windows around each detected question start index.
+  const indices = [];
+
+  for (const n of qnums) {
+    const re = new RegExp(`(^|\\n)\\s*${n}\\s*[\\.|\\)]\\s+`, "g");
+    const m = re.exec(text);
+    if (m && typeof m.index === "number") {
+      indices.push({ n, idx: m.index });
+    }
+  }
+  indices.sort((a, b) => a.idx - b.idx);
+
+  if (indices.length === 0) {
+    // As a last resort, return head
+    return text.slice(0, 12000);
   }
 
-  return { text: out.join("\n"), missing, unsureNums };
+  const windows = [];
+  const len = text.length;
+
+  for (let i = 0; i < indices.length; i++) {
+    const { n, idx } = indices[i];
+    const before = n >= 22 ? 3200 : 1400; // 독해는 지문이 필요하므로 더 크게
+    const after = 2600;
+
+    const start = Math.max(0, idx - before);
+    const end = Math.min(len, idx + after);
+    windows.push([start, end]);
+  }
+
+  // Merge overlapping windows
+  windows.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const w of windows) {
+    const last = merged[merged.length - 1];
+    if (!last || w[0] > last[1]) merged.push(w);
+    else last[1] = Math.max(last[1], w[1]);
+  }
+
+  let excerpt = merged.map(([s, e]) => text.slice(s, e)).join("\n\n---\n\n");
+
+  // Hard cap to avoid model overload / latency
+  if (excerpt.length > 14000) excerpt = excerpt.slice(0, 14000);
+
+  return excerpt;
+}
+
+function mapChoiceToDigit(x) {
+  const s = String(x || "").trim().toUpperCase();
+  if (s === "A") return "1";
+  if (s === "B") return "2";
+  if (s === "C") return "3";
+  if (s === "D") return "4";
+  if (["1", "2", "3", "4"].includes(s)) return s;
+  return null;
+}
+
+function parseAnswers(modelText, targetNums) {
+  const answers = new Map();
+  const text = String(modelText || "");
+
+  // Accept:
+  // "18: 4" , "18 - 4" , "18: D"
+  const re = /(^|\n)\s*(\d{1,2})\s*[:\-]\s*([1-4ABCD])\b/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const n = Number(m[2]);
+    if (!targetNums.includes(n)) continue;
+    const digit = mapChoiceToDigit(m[3]);
+    if (digit) answers.set(n, digit);
+  }
+
+  return answers;
+}
+
+async function callOpenRouter({ apiKey, model, temperature, prompt, maxTokens }) {
+  const url = "https://openrouter.ai/api/v1/chat/completions";
+
+  const body = {
+    model,
+    temperature,
+    max_tokens: maxTokens,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a precise test-solver for HUFS transfer English (50 questions, 4 choices).\n" +
+          "You MUST output ONLY the requested question numbers, each as: n: 1|2|3|4\n" +
+          "No explanations, no extra lines, no missing numbers.\n" +
+          "If choices are labeled A/B/C/D, map A=1, B=2, C=3, D=4.\n" +
+          "If choices are labeled ①②③④, treat them as 1..4 in that order.\n" +
+          "Markers: BLANK means a blank. Underlined words may be wrapped in <...>. Passage markers may be <A><B><C><D>.\n" +
+          "HUFS typical structure hint (do NOT assume answers):\n" +
+          "- 1-13 Vocabulary (1 point): 1-4 sentence completion; 5-9 replace underlined; 10-13 contextual meaning.\n" +
+          "- 14-17 Grammar/Paraphrase (2 points): 14-15 closest meaning; 16-17 sentence completion.\n" +
+          "- 18-19 choose the underlined segment that makes the sentence grammatically INCORRECT.\n" +
+          "- 20-21 choose the grammatically INCORRECT sentence among four.\n" +
+          "- 22-50 Reading comprehension.",
+      },
+      { role: "user", content: prompt },
+    ],
+  };
+
+  // retries (network/5xx)
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          // Optional OpenRouter headers (safe to omit, but ok to keep)
+          "HTTP-Referer": "https://example.com",
+          "X-Title": "HUFS-T2-Solver",
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`OpenRouter HTTP ${res.status}: ${txt.slice(0, 200)}`);
+      }
+
+      const data = await res.json();
+      const out = data?.choices?.[0]?.message?.content ?? "";
+      return String(out);
+    } catch (e) {
+      lastErr = e;
+      await sleep(250 * (attempt + 1));
+    }
+  }
+  throw lastErr || new Error("OpenRouter failed");
 }
 
 exports.handler = async (event) => {
@@ -205,11 +254,6 @@ exports.handler = async (event) => {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) return json(500, { ok: false, error: "OPENROUTER_API_KEY is not set" });
 
-    // FIXED
-    const model = "openai/gpt-4.1";
-    const temperature = 0.1;
-    const maxTokens = 700;
-
     let body = {};
     try {
       body = JSON.parse(event.body || "{}");
@@ -217,126 +261,83 @@ exports.handler = async (event) => {
       return json(400, { ok: false, error: "Invalid JSON body" });
     }
 
-    // Accept combined or multi-page bundle
-    let ocrText = "";
-    if (Array.isArray(body.pages)) {
-      const parts = body.pages
-        .map((p) => {
-          const pg = Number(p?.page ?? "");
-          const tx = safeStr(p?.text ?? p?.ocrText ?? "");
-          if (!tx.trim()) return "";
-          return `\n—— PAGE ${Number.isFinite(pg) ? pg : ""} ——\n${tx}\n`;
-        })
-        .filter(Boolean);
-      ocrText = parts.join("\n");
-    } else {
-      ocrText = safeStr(body.ocrText || body.text || "");
-      const page = body.page ?? "";
-      if (page !== "" && ocrText.trim()) ocrText = `—— PAGE ${page} ——\n` + ocrText;
-    }
+    const raw = String(body.ocrText || body.text || "");
+    const page = body.page ?? null;
 
-    if (!ocrText.trim()) return json(400, { ok: false, error: "Empty ocrText" });
+    const normalized = normalizeText(raw);
+    const qnums = detectQuestionNumbers(normalized);
 
-    const normalized = normalizeOcr(ocrText);
-
-    // Avoid overload
-    const MAX_CHARS = 45000;
-    let clipped = normalized;
-    let clippedInfo = null;
-    if (normalized.length > MAX_CHARS) {
-      const head = normalized.slice(0, 26000);
-      const tail = normalized.slice(-16000);
-      clipped = head + "\n—— CLIPPED MIDDLE ——\n" + tail;
-      clippedInfo = { originalChars: normalized.length, usedChars: clipped.length };
-    }
-
-    const detectedNums = collectQuestionNumbers(clipped);
-
-    // If none detected, do NOT hallucinate 1-50. Return empty.
-    if (detectedNums.length === 0) {
+    // 렉 방지: 문항번호 감지 0이면 모델 호출 자체를 하지 않는다.
+    if (qnums.length === 0) {
       return json(200, {
         ok: true,
         text: "",
-        debug: { model, temperature, detectedNums, note: "No question numbers detected" },
+        debug: {
+          model: "openai/gpt-4.1",
+          temperature: 0.1,
+          page,
+          detectedNums: [],
+          note: "No question numbers detected (line-start n. / n) pattern).",
+        },
       });
     }
 
-    const prompt = buildPrompt(clipped, detectedNums);
+    // "지금 페이지에서 감지된 번호만" 풀기
+    const excerpt = buildRelevantExcerpt(normalized, qnums);
 
-    const url = "https://openrouter.ai/api/v1/chat/completions";
-    const payload = {
+    const prompt =
+      `QUESTION NUMBERS TO ANSWER (ONLY THESE): ${qnums.join(", ")}\n` +
+      `Return EXACTLY one line per number, format: n: 1|2|3|4\n` +
+      `\n=== OCR (normalized excerpt) ===\n` +
+      excerpt;
+
+    const model = "openai/gpt-4.1";
+    const temperature = 0.1;
+
+    const modelText = await callOpenRouter({
+      apiKey,
       model,
       temperature,
-      max_tokens: maxTokens,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Return only the requested answer lines. No explanations. If uncertain, add '?' after the letter.",
-        },
-        { role: "user", content: prompt },
-      ],
-    };
+      prompt,
+      maxTokens: 850,
+    });
 
-    let lastErr = null;
-    const attempts = 3;
+    const parsed = parseAnswers(modelText, qnums);
 
-    for (let i = 0; i < attempts; i++) {
-      try {
-        const res = await fetchWithTimeout(
-          url,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${apiKey}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(payload),
-          },
-          25000
-        );
+    // Fill missing to guarantee "누락 0"
+    // (정답 강제 X. 단지 출력 누락 방지용. 모르면 1? 로 표시)
+    const lines = [];
+    const missing = [];
+    const unsure = [];
 
-        if (!res.ok) {
-          const t = await res.text().catch(() => "");
-          throw new Error(`OpenRouter HTTP ${res.status}: ${t.slice(0, 300)}`);
-        }
-
-        const data = await res.json();
-        const raw =
-          data?.choices?.[0]?.message?.content ??
-          data?.choices?.[0]?.text ??
-          "";
-
-        if (!raw.trim()) throw new Error("Empty model output");
-
-        const { text, missing, unsureNums } = extractAnswersForDetected(raw, detectedNums);
-
-        return json(200, {
-          ok: true,
-          text,
-          debug: {
-            model,
-            temperature,
-            maxTokens,
-            detectedNums,
-            missingFilledWithAq: missing,
-            unsureNums,
-            clippedInfo,
-          },
-        });
-      } catch (e) {
-        lastErr = e;
-        await sleep(400 + i * i * 500);
+    for (const n of qnums) {
+      const a = parsed.get(n);
+      if (a) {
+        lines.push(`${n}: ${a}`);
+      } else {
+        // fallback: mark unsure
+        lines.push(`${n}: 1?`);
+        missing.push(n);
+        unsure.push(n);
       }
     }
 
-    return json(502, {
-      ok: false,
-      error: "Model call failed",
-      detail: String(lastErr?.message || lastErr || "unknown"),
+    return json(200, {
+      ok: true,
+      text: lines.join("\n"),
+      debug: {
+        model,
+        temperature,
+        page,
+        detectedNums: qnums,
+        missingFilledWith: missing,
+        unsureNums: unsure,
+        // for debugging only (trimmed)
+        excerptPreview: excerpt.slice(0, 500),
+      },
     });
   } catch (e) {
-    return json(500, { ok: false, error: "Server error", detail: String(e?.message || e) });
+    return json(500, { ok: false, error: String(e?.message || e) });
   }
 };
 
